@@ -46,6 +46,7 @@ def perform_primary_xgb_training(X_train_encoded, y_train, X_test_encoded, y_tes
         "scale_pos_weight": float(scale_pos_weight),
         "tree_method": "hist",
         "seed": random_state,
+        "base_score": 0.5
     }
 
 

@@ -23,7 +23,7 @@ from src.logistic_regression import get_internet_metrics_caption, get_telco_metr
 from src.random_forest import get_internet_metrics_caption, get_telco_metrics_caption, display_rf_metrics, perform_primary_rf_training, cross_validate_rf_model, hyperparameter_tune_rf, retrain_rf_model
 from src.xgboost import get_internet_metrics_caption, get_telco_metrics_caption, display_xgb_metrics, perform_primary_xgb_training, cross_validate_xgb_model, xgb_random_search, xgb_grid_refine, retrain_xgb_model
 from sklearn.model_selection import StratifiedKFold
-from src.shap import get_lr_explanation, get_rf_explanation
+from src.shap import get_lr_explanation, get_rf_explanation, get_xgb_explanation
 
 
 st.set_page_config(page_title='Churn Prediction Dashboard', layout="wide")
@@ -215,6 +215,10 @@ if selected_dataset in datasets:
             metrics_tab, explainability_tab = st.tabs(["Metrics", "Explanation"])
             column2 = display_xgb_metrics(metrics_tab, row)
             get_telco_metrics_caption(column2)
+
+            # Explainability models
+            shap_tab, lime_tabe = explainability_tab.tabs(["SHAP", "LIME"])
+            get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
         
     # Display internet dataset's null values in a heatmap
     else:
