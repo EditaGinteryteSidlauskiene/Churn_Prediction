@@ -13,7 +13,7 @@ from scipy.special import expit
 from sklearn.metrics import roc_auc_score, auc
 from scipy.stats import spearmanr, kendalltau
 from joblib import Parallel, delayed
-from src.helpers_shap import load_shap
+from utils_shap_io import save_lr_shap, load_lr_shap
 
 def make_get_attribs_lr(lr_model, X_background, model_output="probability"):
     expl = shap.LinearExplainer(lr_model, X_background, model_output=model_output)
@@ -45,21 +45,139 @@ def make_get_attribs_tree(model, X_background, model_output="probability"):
         return np.asarray(vals)
     return get_attribs
 
-def plot_precomputed_shap(dataset: str, model: str, shap_tab, run_id="latest", top_n=15):
+def plot_precomputed_shap(
+    dataset: str,
+    model: str,
+    shap_tab,
+    run_id: str = "latest",
+    top_n: int = 15,
+    X_for_color: pd.DataFrame | None = None,   # <- pass your scaled features here
+):
+    # load precomputed SHAP arrays
+    from src.helpers_shap import load_shap
     values, base, cols, idx = load_shap(dataset, model, run_id)
+
+    # make DataFrame
     shap_df = pd.DataFrame(values, columns=cols, index=idx)
-    top_feats = shap_df.abs().mean().sort_values(ascending=False).head(top_n).index
-    long = (shap_df[top_feats].stack().rename("shap")
-            .reset_index().rename(columns={"level_0":"row","level_1":"feature"}))
-    order = long.groupby("feature")["shap"].apply(lambda s: s.abs().mean()).sort_values().index
-    fig = px.strip(long, x="shap", y="feature", orientation="h",
-                   hover_data={"row": True, "shap":":.4f"},
-                   title=f"{dataset} · {model} — Global SHAP (precomputed)")
+
+    # optional color matrix (must align on rows & columns)
+    if X_for_color is not None:
+        # align strictly to avoid mismatches
+        Xc = X_for_color.reindex(index=shap_df.index, columns=shap_df.columns)
+    else:
+        Xc = None
+
+    # pick top features by mean |SHAP|
+    top_feats = (
+        np.abs(shap_df).mean(axis=0)
+        .sort_values(ascending=False)
+        .head(top_n)
+        .index
+    )
+
+    # long/tidy with optional 'value' column for color
+    long = shap_df[top_feats].stack().rename("shap").to_frame().reset_index()
+    long = long.rename(columns={"level_0": "row", "level_1": "feature"})
+
+    if Xc is not None:
+        vlong = (
+            Xc[top_feats].stack().rename("value").to_frame().reset_index()
+            .rename(columns={"level_0": "row", "level_1": "feature"})
+        )
+        long = long.merge(vlong, on=["row", "feature"], how="left")
+
+    # y-order by mean |SHAP|
+    order = (
+        long.groupby("feature")["shap"]
+            .apply(lambda s: s.abs().mean())
+            .sort_values()
+            .index
+    )
+
+    # figure (match get_lr_explanation)
+    if Xc is not None:
+        fig = px.strip(
+            long, x="shap", y="feature", color="value",
+            orientation="h",
+            hover_data={"row": True, "value": ":.3f", "shap": ":.4f"},
+            title=f"{dataset} · {model} — Global Feature Impact on Churn (precomputed)"
+        )
+        fig.update_layout(coloraxis_showscale=False)
+        # if your features are 0..1 scaled and you want identical color range:
+        # fig.update_layout(coloraxis=dict(cmin=0, cmax=1))
+    else:
+        # fallback without color
+        fig = px.strip(
+            long, x="shap", y="feature",
+            orientation="h",
+            hover_data={"row": True, "shap": ":.4f"},
+            title=f"{dataset} · {model} — Global Feature Impact on Churn (precomputed)"
+        )
+
     fig.update_layout(yaxis=dict(categoryorder="array", categoryarray=order))
-    fig.update_traces(jitter=0.35, marker={"opacity":0.55, "size":4})
+    fig.update_traces(jitter=0.35, marker={"opacity": 0.55, "size": 4})
+    fig.update_layout(
+        yaxis_title="Feature",
+        xaxis_title="Impact on churn probability",
+    )
+
     with shap_tab:
         st.plotly_chart(fig, use_container_width=True)
-        
+
+
+# def get_lr_explanation(lr_model, background_data, X_test_scaled, shap_tab, top_n=15):
+
+#     expl_lr = shap.LinearExplainer(lr_model, background_data, model_output="probability")
+#     sv  = expl_lr(X_test_scaled)
+
+#     shap_vals = sv.values if hasattr(sv, "values") else sv
+#     base_vals = sv.base_values if hasattr(sv, "base_values") else np.full(X_test_scaled.shape[0], shap_vals.mean())
+
+#     # --- Tidy long format for Plotly ---
+#     shap_df = pd.DataFrame(shap_vals, columns=X_test_scaled.columns, index=X_test_scaled.index)
+#     feat_df = X_test_scaled.copy()
+
+#     long = (
+#         shap_df.stack().rename("shap")
+#         .to_frame()
+#         .join(feat_df.stack().rename("value"))
+#         .reset_index()
+#         .rename(columns={"level_0": "row", "level_1": "feature"})
+#     )
+
+#     # --- rank features by mean(|SHAP|) ---
+#     feat_order = (
+#         long.groupby("feature")["shap"]
+#             .apply(lambda s: s.abs().mean())
+#             .sort_values(ascending=True)
+#             .index.tolist()
+#     )
+
+#     # --- 1) Beeswarm-like strip (direction + value color) ---
+#     # Right = raises churn prob; Left = lowers churn prob
+#     fig_beeswarm = px.strip(
+#         long, x="shap", y="feature", color="value",
+#         orientation="h",
+#         hover_data={"row": True, "value": ":.3f", "shap": ":.4f"},
+#         title="Global Feature Impact on Churn"
+#     )
+#     fig_beeswarm.update_layout(yaxis=dict(categoryorder="array", categoryarray=feat_order))
+#     fig_beeswarm.update_traces(jitter=0.35, marker={"opacity": 0.55, "size": 4})
+#     fig_beeswarm.update_layout(
+#         yaxis_title="Feature", 
+#         xaxis_title="Impact on churn probability",
+#         coloraxis_showscale=False
+#         )
+#     fig_beeswarm.update_layout(coloraxis=dict(cmin=0, cmax=1))
+
+#     with shap_tab:
+#         st.markdown(
+#                 "### Global Explanation"
+#             )
+#         column1, column2 = st.columns([2, 1])
+
+#         column1.plotly_chart(fig_beeswarm)
+
 def collect_attributions_for_tests(
     *,
     # --- Logistic Regression (scaled) ---
