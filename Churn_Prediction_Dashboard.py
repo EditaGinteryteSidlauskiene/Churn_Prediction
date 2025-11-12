@@ -2762,7 +2762,7 @@ if selected_dataset in datasets:
             A_xgb_booster = attribs["xgb_booster"]
             
             # val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
-            shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
+            lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
 
 
             # Faithfulness
@@ -3012,7 +3012,7 @@ if selected_dataset in datasets:
 
 
             # get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
-            xgb_local_shap_by_truth(bst, X_test_encoded, X_test, y_test, 0.42, shap_tab, background_data_encoded)
+            # xgb_local_shap_by_truth(bst, X_test_encoded, X_test, y_test, 0.42, shap_tab, background_data_encoded)
             get_lime_explanations_binary(bst, X_test, X_train_encoded, X_test_encoded, y_test, 0.42, lime_tab, title_prefix="Local LIME – XGBoost")
 
             adapted = XGBoosterAdapter(bst, objective="binary:logistic")
