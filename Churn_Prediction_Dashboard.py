@@ -571,17 +571,19 @@ if selected_dataset in datasets:
         #     val_tab.write(f"Spearman ρ vs original after label randomization: **{san['spearman_rho_vs_original']:.3f}** "
         #                   "(should drop toward 0 if explanations depend on learned signal)")
 
-            get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
-            lr_local_shap_by_truth(
-                lr_model=tuned_model,
-                background_data=background_data_scaled,
-                X_test_scaled=scaled_X_test_features,
-                X_test=X_test,
-                y_test=y_test,             # must be aligned with X_test_scaled index
-                shap_tab=shap_tab,
-                threshold=0.5832,            # your operating threshold
-                top_display=12
-                )   
+            if shap_tab.button("Compute Logistic Regression Global SHAP explanation"):
+                get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
+            elif if shap_tab.button("Compute Logistic Regression Local SHAP explanation"):
+                lr_local_shap_by_truth(
+                    lr_model=tuned_model,
+                    background_data=background_data_scaled,
+                    X_test_scaled=scaled_X_test_features,
+                    X_test=X_test,
+                    y_test=y_test,             # must be aligned with X_test_scaled index
+                    shap_tab=shap_tab,
+                    threshold=0.5832,            # your operating threshold
+                    top_display=12
+                    )   
             get_lime_explanations_binary(tuned_model, X_test, scaled_X_train_features, scaled_X_test_features, y_test, 0.5832, lime_tab, title_prefix="Local LIME – Logistic Regression")        
 
             lr_for_dice = ThresholdedModel(tuned_model, threshold=0.5832)
@@ -2029,7 +2031,7 @@ if selected_dataset in datasets:
             #               "(should drop toward 0 if explanations depend on learned signal)")
 
 
-            # get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
+            get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
             lr_local_shap_by_truth(
                 lr_model=tuned_model,
                 background_data=background_data_scaled,
@@ -2200,7 +2202,7 @@ if selected_dataset in datasets:
             )
             A_rf = attribs["rf"] 
 
-            val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
+            # val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
             shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
 
             # Faithfulness
@@ -2574,7 +2576,7 @@ if selected_dataset in datasets:
 
 
 
-            # get_rf_explanation(tuned_model, background_data_encoded, X_test_encoded, shap_tab)
+            get_rf_explanation(tuned_model, background_data_encoded, X_test_encoded, shap_tab)
             rf_local_shap_by_truth(tuned_model, X_test_encoded, X_test, y_test, 0.426, shap_tab, background_data_encoded)
             get_lime_explanations_binary(tuned_model, X_test, X_train_encoded, X_test_encoded, y_test, 0.426, lime_tab, title_prefix="Local LIME – Random Forest")
 
@@ -2761,7 +2763,7 @@ if selected_dataset in datasets:
             )
             A_xgb_booster = attribs["xgb_booster"]
             
-            val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
+            # val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
             shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
 
 
@@ -2868,7 +2870,7 @@ if selected_dataset in datasets:
             # Stability
             # booster_for_shap = _patch_base_score_in_modelfile(bst)
 
-            # # # ✅ take the schema the Booster was trained with
+            # # # take the schema the Booster was trained with
             # FEAT_TRAIN = booster_for_shap.feature_names or X_train_encoded.columns.tolist()
 
             # # # hard-schema attrib function that also normalizes dash variants
@@ -3011,7 +3013,7 @@ if selected_dataset in datasets:
 
 
 
-            # get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
+            get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
             xgb_local_shap_by_truth(bst, X_test_encoded, X_test, y_test, 0.42, shap_tab, background_data_encoded)
             get_lime_explanations_binary(bst, X_test, X_train_encoded, X_test_encoded, y_test, 0.42, lime_tab, title_prefix="Local LIME – XGBoost")
 
