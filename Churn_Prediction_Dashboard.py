@@ -575,7 +575,7 @@ if selected_dataset in datasets:
             tab_names = ["SHAP", "LIME", "Counterfactuals"]
             choice = st.radio("View", tab_names, horizontal=True, label_visibility="collapsed")
 
-            if choice == "SHAP":
+            with shap_tab:
                 get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
                 lr_local_shap_by_truth(
                     lr_model=tuned_model,
@@ -587,10 +587,10 @@ if selected_dataset in datasets:
                     threshold=0.5832,            # your operating threshold
                     top_display=12
                     ) 
-            elif choice == "LIME":
+            with lime_tab:
                 get_lime_explanations_binary(tuned_model, X_test, scaled_X_train_features, scaled_X_test_features, y_test, 0.5832, lime_tab, title_prefix="Local LIME – Logistic Regression")        
 
-            elif choice == "Counterfactuals":
+            with counterfactual_tab:
                 lr_for_dice = ThresholdedModel(tuned_model, threshold=0.5832)
     
                 continuous_features = [
