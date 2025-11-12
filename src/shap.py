@@ -13,6 +13,7 @@ from scipy.special import expit
 from sklearn.metrics import roc_auc_score, auc
 from scipy.stats import spearmanr, kendalltau
 from joblib import Parallel, delayed
+from helpers_shap import load_shap
 
 def make_get_attribs_lr(lr_model, X_background, model_output="probability"):
     expl = shap.LinearExplainer(lr_model, X_background, model_output=model_output)
@@ -44,60 +45,24 @@ def make_get_attribs_tree(model, X_background, model_output="probability"):
         return np.asarray(vals)
     return get_attribs
 
-
-def get_lr_explanation(lr_model, background_data, X_test_scaled, shap_tab, top_n=15):
-
-    expl_lr = shap.LinearExplainer(lr_model, background_data, model_output="probability")
-    sv  = expl_lr(X_test_scaled)
-
-    shap_vals = sv.values if hasattr(sv, "values") else sv
-    base_vals = sv.base_values if hasattr(sv, "base_values") else np.full(X_test_scaled.shape[0], shap_vals.mean())
-
-    # --- Tidy long format for Plotly ---
-    shap_df = pd.DataFrame(shap_vals, columns=X_test_scaled.columns, index=X_test_scaled.index)
-    feat_df = X_test_scaled.copy()
-
-    long = (
-        shap_df.stack().rename("shap")
-        .to_frame()
-        .join(feat_df.stack().rename("value"))
-        .reset_index()
-        .rename(columns={"level_0": "row", "level_1": "feature"})
-    )
-
-    # --- rank features by mean(|SHAP|) ---
-    feat_order = (
-        long.groupby("feature")["shap"]
-            .apply(lambda s: s.abs().mean())
-            .sort_values(ascending=True)
-            .index.tolist()
-    )
-
-    # --- 1) Beeswarm-like strip (direction + value color) ---
-    # Right = raises churn prob; Left = lowers churn prob
-    fig_beeswarm = px.strip(
-        long, x="shap", y="feature", color="value",
-        orientation="h",
-        hover_data={"row": True, "value": ":.3f", "shap": ":.4f"},
-        title="Global Feature Impact on Churn"
-    )
-    fig_beeswarm.update_layout(yaxis=dict(categoryorder="array", categoryarray=feat_order))
-    fig_beeswarm.update_traces(jitter=0.35, marker={"opacity": 0.55, "size": 4})
-    fig_beeswarm.update_layout(
-        yaxis_title="Feature", 
-        xaxis_title="Impact on churn probability",
-        coloraxis_showscale=False
-        )
-    fig_beeswarm.update_layout(coloraxis=dict(cmin=0, cmax=1))
-
+def plot_precomputed_shap(dataset: str, model: str, shap_tab, run_id="latest", top_n=15):
+    values, base, cols, idx = load_shap(dataset, model, run_id)
+    shap_df = pd.DataFrame(values, columns=cols, index=idx)
+    top_feats = shap_df.abs().mean().sort_values(ascending=False).head(top_n).index
+    long = (shap_df[top_feats].stack().rename("shap")
+            .reset_index().rename(columns={"level_0":"row","level_1":"feature"}))
+    order = long.groupby("feature")["shap"].apply(lambda s: s.abs().mean()).sort_values().index
+    fig = px.strip(long, x="shap", y="feature", orientation="h",
+                   hover_data={"row": True, "shap":":.4f"},
+                   title=f"{dataset} · {model} — Global SHAP (precomputed)")
+    fig.update_layout(yaxis=dict(categoryorder="array", categoryarray=order))
+    fig.update_traces(jitter=0.35, marker={"opacity":0.55, "size":4})
     with shap_tab:
-        st.markdown(
-                "### Global Explanation"
-            )
-        column1, column2 = st.columns([2, 1])
+        st.plotly_chart(fig, use_container_width=True)
 
-        column1.plotly_chart(fig_beeswarm)
-
+        shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
+        plot_precomputed_shap("Telco", "LR", shap_tab)
+        
 def collect_attributions_for_tests(
     *,
     # --- Logistic Regression (scaled) ---

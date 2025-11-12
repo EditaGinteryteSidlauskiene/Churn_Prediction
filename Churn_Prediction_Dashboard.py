@@ -24,6 +24,7 @@ from src.random_forest import get_internet_rf_metrics_caption, get_telco_rf_metr
 from src.xgboost import get_internet_xgb_metrics_caption, get_telco_xgb_metrics_caption, display_xgb_metrics, perform_primary_xgb_training, cross_validate_xgb_model, xgb_random_search, xgb_grid_refine, retrain_xgb_model
 from sklearn.model_selection import StratifiedKFold
 from src.shap import (
+    plot_precomputed_shap,
     get_lr_explanation, get_rf_explanation, get_xgb_explanation,
     lr_local_shap_by_truth, rf_local_shap_by_truth, xgb_local_shap_by_truth,
     collect_attributions_for_tests, faithfulness_report, stability_report, sanity_report, local_faithfulness_report, _patch_base_score_in_modelfile, 
@@ -43,6 +44,7 @@ from scipy.stats import kendalltau, spearmanr
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils.validation import check_is_fitted
 import hashlib
+from helpers_shap import save_shap
 
 def _spearman_abs(a: np.ndarray, b: np.ndarray) -> float:
     """Spearman ρ between |a| and |b| (robust to sign)."""
@@ -571,9 +573,26 @@ if selected_dataset in datasets:
         #     val_tab.write(f"Spearman ρ vs original after label randomization: **{san['spearman_rho_vs_original']:.3f}** "
         #                   "(should drop toward 0 if explanations depend on learned signal)")
 
-            
+            def compute_shap_lr(model, background_df, X_df):
+                expl = shap.LinearExplainer(model, background_df, model_output="probability")
+                sv = expl(X_df)
+                values = sv.values if hasattr(sv, "values") else sv
+                base = sv.base_values if hasattr(sv, "base_values") else np.full(X_df.shape[0], values.mean())
+                return values, base
 
-            get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
+            vals, base = compute_shap_lr(tuned_model, background_data_scaled, scaled_X_test_features)
+            save_shap(
+                dataset="Telco",
+                model="LR",
+                values=vals,
+                base_values=base,
+                feature_names=list(scaled_X_test_features.columns),
+                row_index=list(scaled_X_test_features.index),
+                run_id="latest"  
+            )
+
+            # plot_precomputed_shap("Telco", "LR", shap_tab, run_id="latest", top_n=15)
+            # get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
             lr_local_shap_by_truth(
                 lr_model=tuned_model,
                 background_data=background_data_scaled,
