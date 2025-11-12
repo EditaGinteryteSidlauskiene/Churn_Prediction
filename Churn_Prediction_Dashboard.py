@@ -128,15 +128,10 @@ internet_data = internet_data.rename(columns={'reamining_contract': 'remaining_c
 # Map dataset names to DataFrames
 datasets = {
     "Telco Dataset": telco_data,
-    # "Internet Dataset": internet_data
+    "Internet Dataset": internet_data
 }
 
-# --- Sidebar: dataset picker ---
-selected_dataset = st.sidebar.selectbox(
-    label="Choose a dataset",
-    options=list(datasets.keys()),
-    index=0  # optional: pick the first by default
-)
+selected_dataset = st.sidebar.selectbox("Choose a dataset:", list(datasets.keys()))
 
 # Display info of the selected dataset
 if selected_dataset in datasets:
@@ -145,12 +140,11 @@ if selected_dataset in datasets:
     st.markdown(f'##### {selected_dataset}')
     expander = st.expander('About this dataset')
     
-    expander.write(get_telco_data_analysis())
-    # # Display data explanation
-    # if selected_dataset == 'Telco Dataset':
-    #     expander.write(get_telco_data_analysis())
-    # elif selected_dataset == 'Internet Dataset':
-    #     expander.write(get_internet_data_analysis())
+    # Display data explanation
+    if selected_dataset == 'Telco Dataset':
+        expander.write(get_telco_data_analysis())
+    elif selected_dataset == 'Internet Dataset':
+        expander.write(get_internet_data_analysis())
 
     # Create four columns and get metrics
     data_info_col1, data_info_col2, data_info_col3, data_info_col4 = st.columns([1, 1, 1, 1])
