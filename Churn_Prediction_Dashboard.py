@@ -571,8 +571,6 @@ if selected_dataset in datasets:
         #     val_tab.write(f"Spearman ρ vs original after label randomization: **{san['spearman_rho_vs_original']:.3f}** "
         #                   "(should drop toward 0 if explanations depend on learned signal)")
 
-            
-
             get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
             lr_local_shap_by_truth(
                 lr_model=tuned_model,
