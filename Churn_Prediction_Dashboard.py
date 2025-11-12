@@ -572,24 +572,24 @@ if selected_dataset in datasets:
         #     val_tab.write(f"Spearman ρ vs original after label randomization: **{san['spearman_rho_vs_original']:.3f}** "
         #                   "(should drop toward 0 if explanations depend on learned signal)")
 
-            def compute_shap_lr(model, background_df, X_df):
-                expl = shap.LinearExplainer(model, background_df, model_output="probability")
-                sv = expl(X_df)
-                values = sv.values if hasattr(sv, "values") else sv
-                base = sv.base_values if hasattr(sv, "base_values") else np.full(X_df.shape[0], values.mean())
-                return values, base
+            # def compute_shap_lr(model, background_df, X_df):
+            #     expl = shap.LinearExplainer(model, background_df, model_output="probability")
+            #     sv = expl(X_df)
+            #     values = sv.values if hasattr(sv, "values") else sv
+            #     base = sv.base_values if hasattr(sv, "base_values") else np.full(X_df.shape[0], values.mean())
+            #     return values, base
 
-            vals, base = compute_shap_lr(tuned_model, background_data_scaled, scaled_X_test_features)
-            save_shap(
-                dataset="Telco",
-                model="LR",
-                values=vals,
-                base_values=base,
-                feature_names=list(scaled_X_test_features.columns),
-                row_index=list(scaled_X_test_features.index),
-                run_id="latest"  
-            )
-            # plot_precomputed_shap("Telco", "LR", shap_tab)
+            # vals, base = compute_shap_lr(tuned_model, background_data_scaled, scaled_X_test_features)
+            # save_shap(
+            #     dataset="Telco",
+            #     model="LR",
+            #     values=vals,
+            #     base_values=base,
+            #     feature_names=list(scaled_X_test_features.columns),
+            #     row_index=list(scaled_X_test_features.index),
+            #     run_id="latest"  
+            # )
+            plot_precomputed_shap("Telco", "LR", shap_tab)
             # get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
             lr_local_shap_by_truth(
                 lr_model=tuned_model,
