@@ -24,8 +24,7 @@ from src.random_forest import get_internet_rf_metrics_caption, get_telco_rf_metr
 from src.xgboost import get_internet_xgb_metrics_caption, get_telco_xgb_metrics_caption, display_xgb_metrics, perform_primary_xgb_training, cross_validate_xgb_model, xgb_random_search, xgb_grid_refine, retrain_xgb_model
 from sklearn.model_selection import StratifiedKFold
 from src.shap_utils import (
-    plot_precomputed_shap,
-    get_lr_explanation, get_rf_explanation, get_xgb_explanation,
+    plot_precomputed_shap, get_rf_explanation, get_xgb_explanation,
     lr_local_shap_by_truth, rf_local_shap_by_truth, xgb_local_shap_by_truth,
     collect_attributions_for_tests, faithfulness_report, stability_report, sanity_report, local_faithfulness_report, _patch_base_score_in_modelfile, 
     make_get_attribs_xgb_booster, make_get_attribs_xgb_booster_with_schema
