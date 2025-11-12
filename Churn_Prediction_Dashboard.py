@@ -2574,7 +2574,7 @@ if selected_dataset in datasets:
 
 
 
-            get_rf_explanation(tuned_model, background_data_encoded, X_test_encoded, shap_tab)
+            # get_rf_explanation(tuned_model, background_data_encoded, X_test_encoded, shap_tab)
             rf_local_shap_by_truth(tuned_model, X_test_encoded, X_test, y_test, 0.426, shap_tab, background_data_encoded)
             get_lime_explanations_binary(tuned_model, X_test, X_train_encoded, X_test_encoded, y_test, 0.426, lime_tab, title_prefix="Local LIME – Random Forest")
 
@@ -3011,7 +3011,7 @@ if selected_dataset in datasets:
 
 
 
-            get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
+            # get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
             xgb_local_shap_by_truth(bst, X_test_encoded, X_test, y_test, 0.42, shap_tab, background_data_encoded)
             get_lime_explanations_binary(bst, X_test, X_train_encoded, X_test_encoded, y_test, 0.42, lime_tab, title_prefix="Local LIME – XGBoost")
 
