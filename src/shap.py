@@ -59,9 +59,6 @@ def plot_precomputed_shap(dataset: str, model: str, shap_tab, run_id="latest", t
     fig.update_traces(jitter=0.35, marker={"opacity":0.55, "size":4})
     with shap_tab:
         st.plotly_chart(fig, use_container_width=True)
-
-        shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
-        plot_precomputed_shap("Telco", "LR", shap_tab)
         
 def collect_attributions_for_tests(
     *,
