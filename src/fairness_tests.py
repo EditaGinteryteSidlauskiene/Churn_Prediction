@@ -1,5 +1,5 @@
-def display_fairness_table_lr(X_test, tuned_model, scaled_X_test_features, threshold):
-    def group_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.5832, reference=None):
+def display_fairness_table_lr(X_test, y_test, tuned_model, scaled_X_test_features, threshold):
+    def group_fairness_table(df, group_col, threshold, y_true='y_true', y_proba='y_proba', reference=None):
         """Return a per-group fairness table and the chosen reference group."""
         # pick reference = largest group if not provided
         ref = reference or df[group_col].value_counts().idxmax()
@@ -64,7 +64,7 @@ def display_fairness_table_lr(X_test, tuned_model, scaled_X_test_features, thres
         for gcol in group_cols:
             sub = df_eval[[gcol, "y_true", "y_proba"]].dropna()
             table, ref = group_fairness_table(
-                sub, group_col=gcol, y_true="y_true", y_proba="y_proba", threshold=threshold
+                sub, gcol, threshold, y_true="y_true", y_proba="y_proba"
             )
             model_tables[gcol] = (table, ref)
         results[name] = model_tables
