@@ -597,41 +597,41 @@ if selected_dataset in datasets:
                 if st.button("Compute Counterfactuals", key="btn_cf") or st.session_state.get("btn_cf"):
                      lr_for_dice = ThresholdedModel(tuned_model, threshold=0.5832)
     
-                continuous_features = [
-                    "tenure",
-                    "MonthlyCharges",
-                    "TotalCharges",          
-                    "AvgMonthlyCharge",
-                    "OnlineServiceCount",
-                    "AvgPricePerService",
-                ]
-    
-                features_to_vary = [
-                    "PhoneService","MultipleLines","OnlineSecurity","OnlineBackup",
-                    "DeviceProtection","TechSupport","StreamingTV","StreamingMovies",
-                    "PaperlessBilling","MonthlyCharges",
-                    "Contract_One year","Contract_Two year",
-                    "PaymentMethod_Credit card (automatic)","PaymentMethod_Electronic check","PaymentMethod_Mailed check",
-                    "InternetService_Fiber optic","InternetService_No",
-                ]
-    
-                results = get_counterfactual_analysis(
-                    y_test=y_test,
-                    X_test=scaled_X_test_features,
-                    X_train=scaled_X_train_features,
-                    y_train=y_train,
-                    model=lr_for_dice,                         # must expose predict_proba
-                    continuous_features=continuous_features,
-                    counterfactual_tab=counterfactual_tab,
-                    outcome_name="Churn",
-                    total_CFs=6,
-                    features_to_vary=features_to_vary,                    # or "all"
-                    permitted_range={"MonthlyCharges":[15,150]},
-                    scaler=scaler,
-                    numeric_feature_names_in_scaler_order=num_cols_in_scaler_order,
-                    immutable_features=immutable,
-                    onehot_groups=onehot_groups,
-                )
+                    continuous_features = [
+                        "tenure",
+                        "MonthlyCharges",
+                        "TotalCharges",          
+                        "AvgMonthlyCharge",
+                        "OnlineServiceCount",
+                        "AvgPricePerService",
+                    ]
+        
+                    features_to_vary = [
+                        "PhoneService","MultipleLines","OnlineSecurity","OnlineBackup",
+                        "DeviceProtection","TechSupport","StreamingTV","StreamingMovies",
+                        "PaperlessBilling","MonthlyCharges",
+                        "Contract_One year","Contract_Two year",
+                        "PaymentMethod_Credit card (automatic)","PaymentMethod_Electronic check","PaymentMethod_Mailed check",
+                        "InternetService_Fiber optic","InternetService_No",
+                    ]
+        
+                    results = get_counterfactual_analysis(
+                        y_test=y_test,
+                        X_test=scaled_X_test_features,
+                        X_train=scaled_X_train_features,
+                        y_train=y_train,
+                        model=lr_for_dice,                         # must expose predict_proba
+                        continuous_features=continuous_features,
+                        counterfactual_tab=counterfactual_tab,
+                        outcome_name="Churn",
+                        total_CFs=6,
+                        features_to_vary=features_to_vary,                    # or "all"
+                        permitted_range={"MonthlyCharges":[15,150]},
+                        scaler=scaler,
+                        numeric_feature_names_in_scaler_order=num_cols_in_scaler_order,
+                        immutable_features=immutable,
+                        onehot_groups=onehot_groups,
+                    )
 
         elif selected_prediction_model == 'Random Forest':
             
