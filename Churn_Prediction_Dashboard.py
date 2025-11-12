@@ -43,7 +43,6 @@ from scipy.stats import kendalltau, spearmanr
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils.validation import check_is_fitted
 import hashlib
-from src.fairness_tests import display_fairness_table_lr
 
 def _spearman_abs(a: np.ndarray, b: np.ndarray) -> float:
     """Spearman ρ between |a| and |b| (robust to sign)."""
@@ -261,8 +260,95 @@ if selected_dataset in datasets:
             # cross_validate_lg_model(X_train_encoded, y_train, cross_validation, "balanced")
             # hyperparameter_tune_lg(X_train_encoded, y_train, cross_validation)
             metrics, tuned_model = retrain_lg_model(scaled_X_train_features, y_train, scaled_X_test_features, y_test, 0.5832, 0.00316)
-            display_fairness_table_lr(X_test, y_test, tuned_model, scaled_X_test_features, 0.5832)
-            
+
+            # def group_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.5832, reference=None):
+            #     """Return a per-group fairness table and the chosen reference group."""
+            #     # pick reference = largest group if not provided
+            #     ref = reference or df[group_col].value_counts().idxmax()
+
+            #     def recall_pos(g):
+            #         mask = g[y_true] == 1
+            #         if mask.sum() == 0:
+            #             return np.nan
+            #         y_hat = (g[y_proba] >= threshold).astype(int)
+            #         return recall_score(g.loc[mask, y_true], y_hat[mask])
+
+            #     agg = (
+            #         df.groupby(group_col)
+            #           .apply(lambda g: pd.Series({
+            #               'n': len(g),
+            #               'observed_churn_rate': g[y_true].mean(),
+            #               'mean_pred_proba': g[y_proba].mean(),
+            #               f'prediction_rate@{threshold:.3f}': (g[y_proba] >= threshold).mean(),
+            #               'recall_pos': recall_pos(g),
+            #           }))
+            #           .reset_index()
+            #     )
+
+            #     ref_mean = agg.loc[agg[group_col] == ref, 'mean_pred_proba'].values[0]
+            #     agg[f'Δ_vs_{ref}'] = (agg['mean_pred_proba'] - ref_mean).abs()
+            #     agg['stat_parity_ok(≤0.05)'] = agg[f'Δ_vs_{ref}'] <= 0.05
+            #     return agg.sort_values('n', ascending=False), ref
+
+            # group_cols = ["gender", "SeniorCitizen", "Partner", "Dependents", "Contract", "PaymentMethod", "InternetService", "PaperlessBilling"]  
+            # threshold = 0.5832
+            # X_test_original_groups = X_test[group_cols].copy()
+            # if hasattr(y_test, "dtype") and y_test.dtype == object:
+            #     y_true = y_test.map({"No": 0, "Yes": 1}).astype(int)
+            # elif isinstance(y_test, pd.DataFrame) and "Churn" in y_test.columns:
+            #     y_true = y_test["Churn"].map({"No": 0, "Yes": 1}).astype(int)
+            # else:
+            #     y_true = y_test.astype(int)  # already 0/1
+
+            # if hasattr(tuned_model, "predict_proba"):           # single estimator
+            #     models = {"logreg_final": tuned_model}
+            # elif isinstance(tuned_model, (list, tuple)):        # list/tuple of estimators
+            #     models = {f"model_{i}": m for i, m in enumerate(tuned_model)}
+            # elif isinstance(tuned_model, dict):                  # already a dict
+            #     models = tuned_model
+            # else:
+            #     raise TypeError("tuned_model must be an estimator, list/tuple of estimators, or dict.")
+
+            # X_for_pred = scaled_X_test_features
+
+            # results = {}
+            # for name, model in models.items():
+            #     # get probabilities for the positive class
+            #     y_proba = model.predict_proba(X_for_pred)[:, 1]
+
+            #     # build evaluation frame aligned by index
+            #     df_eval = X_test_original_groups.copy()
+            #     df_eval["y_true"] = pd.Series(y_true.values, index=df_eval.index)
+            #     df_eval["y_proba"] = pd.Series(y_proba, index=df_eval.index)
+
+            # # per-group tables for this model
+            #     model_tables = {}
+            #     for gcol in group_cols:
+            #         sub = df_eval[[gcol, "y_true", "y_proba"]].dropna()
+            #         table, ref = group_fairness_table(
+            #             sub, group_col=gcol, y_true="y_true", y_proba="y_proba", threshold=threshold
+            #         )
+            #         model_tables[gcol] = (table, ref)
+            #     results[name] = model_tables
+
+            # st.title("Fairness Evaluation — Group-Based Metrics")
+            # st.write("Global threshold for recall comparisons (equal opportunity): ", threshold)
+
+            # for model_name, tables in results.items():
+            #     with st.expander(f"Model: {model_name}", expanded=False):
+            #         for gcol, (table, ref) in tables.items():
+            #             st.subheader(f"Group column: {gcol} (ref: {ref})")
+            #             st.dataframe(table, use_container_width=True)
+
+            #             # CSV download
+            #             csv_buf = StringIO()
+            #             table.to_csv(csv_buf, index=False)
+            #             st.download_button(
+            #                 label=f"Download CSV — {model_name} · {gcol}",
+            #                 data=csv_buf.getvalue(),
+            #                 file_name=f"fairness_{model_name}_{gcol}.csv",
+            #                 mime="text/csv"
+            #             )
 
             st.subheader("Logistic Regression Performance Analysis")
             metrics_tab, explainability_tab = st.tabs(["Metrics", "Explanation"])
@@ -1682,11 +1768,13 @@ if selected_dataset in datasets:
                 xgb_clf=None,
                 X_train_enc=None,
                 X_val_enc=None,
+"""Streamlit entry point for the churn prediction dashboard."""
 
                 xgb_booster=None,
                 use_streamlit=True
             )
             A_lr = attribs["lr"]
+from __future__ import annotations
 
             # val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
             shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
@@ -3231,6 +3319,7 @@ if selected_dataset in datasets:
 #             .sort_values("abs_", ascending=False)
 #             .drop(columns="abs_")
 #         )
+import streamlit as st
 
 #         fig_row = px.bar(
 #             contrib_df.head(12).iloc[::-1],
@@ -3251,6 +3340,16 @@ if selected_dataset in datasets:
 #                        'from Electronic check (+0.054), PhoneService (+0.043), Contract_Two year (+0.043), ' \
 #                        'InternetService_No (+0.035), plus OnlineBackup/OnlineSecurity and Contract_One year (small positives). ' \
 #                         'The main factors reducing churn risk are InternetService_Fiber optic (−0.063) and, slightly, SeniorCitizen (−0.016).')
+from src.dashboard.data import (
+    INTERNET_DATASET_NAME,
+    TELCO_DATASET_NAME,
+    load_datasets,
+)
+from src.dashboard.internet import handle_internet_dataset
+from src.dashboard.layout import configure_page, render_dataset_overview
+from src.dashboard.telco import handle_telco_dataset
+from src.internet_data_analysis import get_internet_data_analysis
+from src.telco_data_analysis import get_telco_data_analysis
 
 #     #----------------------- LIME -----------------------
 #     with tab_lime:
@@ -3268,9 +3367,20 @@ if selected_dataset in datasets:
 #             predict_fn=random_forest_model.predict_proba,
 #             num_features=10
 #          )
+def main() -> None:
+    configure_page()
+    datasets = load_datasets()
+    dataset_descriptions = {
+        TELCO_DATASET_NAME: get_telco_data_analysis,
+        INTERNET_DATASET_NAME: get_internet_data_analysis,
+    }
 
 #         lime_items = lime_explanation.as_list()  # list of (feature_or_rule, weight)
 #         lime_table = pd.DataFrame(lime_items, columns=["feature_or_rule", "lime_weight"])
+    selected_dataset = st.sidebar.selectbox(
+        "Choose a dataset:",
+        list(datasets.keys()),
+    )
 
 #         fig_lime_customer = px.bar(
 #             lime_table.iloc[::-1],
@@ -3279,6 +3389,7 @@ if selected_dataset in datasets:
 #             title=f"LIME local explanation — row 0",
 #             labels={"lime_weight":"Local weight (→ churn + / ← non-churn −)", "feature_or_rule":"Feature / Rule"}
 #         )
+    render_dataset_overview(selected_dataset, datasets, dataset_descriptions)
 
 #         tab_lime.plotly_chart(fig_lime_customer, use_container_width=True)
 #         tab_lime.markdown('Bars show simple rules near this customer and their local weight: right = pushes toward churn, ' \
@@ -3294,4 +3405,11 @@ if selected_dataset in datasets:
 #         '(early lifecycle), not on a 1-year contract, has internet service (vs. “no internet”), pays by electronic ' \
 #         'check, and no TechSupport/OnlineSecurity.\nRisk reducers: not using fiber-optic internet (largest negative)'
 #         ' and StreamingMovies (small negative).')
+    if selected_dataset == TELCO_DATASET_NAME:
+        handle_telco_dataset(datasets[selected_dataset])
+    elif selected_dataset == INTERNET_DATASET_NAME:
+        handle_internet_dataset(datasets[selected_dataset])
 
+
+if __name__ == "__main__":
+    main()
