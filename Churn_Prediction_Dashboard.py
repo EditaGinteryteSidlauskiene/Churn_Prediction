@@ -572,57 +572,62 @@ if selected_dataset in datasets:
         #                   "(should drop toward 0 if explanations depend on learned signal)")
 
             
+            tab_names = ["SHAP", "LIME", "Counterfactuals"]
+            choice = st.radio("View", tab_names, horizontal=True, label_visibility="collapsed")
 
-            get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
-            lr_local_shap_by_truth(
-                lr_model=tuned_model,
-                background_data=background_data_scaled,
-                X_test_scaled=scaled_X_test_features,
-                X_test=X_test,
-                y_test=y_test,             # must be aligned with X_test_scaled index
-                shap_tab=shap_tab,
-                threshold=0.5832,            # your operating threshold
-                top_display=12
-                )   
-            get_lime_explanations_binary(tuned_model, X_test, scaled_X_train_features, scaled_X_test_features, y_test, 0.5832, lime_tab, title_prefix="Local LIME – Logistic Regression")        
+            if choice == "SHAP":
+                get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
+                lr_local_shap_by_truth(
+                    lr_model=tuned_model,
+                    background_data=background_data_scaled,
+                    X_test_scaled=scaled_X_test_features,
+                    X_test=X_test,
+                    y_test=y_test,             # must be aligned with X_test_scaled index
+                    shap_tab=shap_tab,
+                    threshold=0.5832,            # your operating threshold
+                    top_display=12
+                    ) 
+            elif choice == "LIME":
+                get_lime_explanations_binary(tuned_model, X_test, scaled_X_train_features, scaled_X_test_features, y_test, 0.5832, lime_tab, title_prefix="Local LIME – Logistic Regression")        
 
-            lr_for_dice = ThresholdedModel(tuned_model, threshold=0.5832)
-
-            continuous_features = [
-                "tenure",
-                "MonthlyCharges",
-                "TotalCharges",          
-                "AvgMonthlyCharge",
-                "OnlineServiceCount",
-                "AvgPricePerService",
-            ]
-
-            features_to_vary = [
-                "PhoneService","MultipleLines","OnlineSecurity","OnlineBackup",
-                "DeviceProtection","TechSupport","StreamingTV","StreamingMovies",
-                "PaperlessBilling","MonthlyCharges",
-                "Contract_One year","Contract_Two year",
-                "PaymentMethod_Credit card (automatic)","PaymentMethod_Electronic check","PaymentMethod_Mailed check",
-                "InternetService_Fiber optic","InternetService_No",
-            ]
-
-            results = get_counterfactual_analysis(
-                y_test=y_test,
-                X_test=scaled_X_test_features,
-                X_train=scaled_X_train_features,
-                y_train=y_train,
-                model=lr_for_dice,                         # must expose predict_proba
-                continuous_features=continuous_features,
-                counterfactual_tab=counterfactual_tab,
-                outcome_name="Churn",
-                total_CFs=6,
-                features_to_vary=features_to_vary,                    # or "all"
-                permitted_range={"MonthlyCharges":[15,150]},
-                scaler=scaler,
-                numeric_feature_names_in_scaler_order=num_cols_in_scaler_order,
-                immutable_features=immutable,
-                onehot_groups=onehot_groups,
-            )
+            elif choice == "Counterfactuals":
+                lr_for_dice = ThresholdedModel(tuned_model, threshold=0.5832)
+    
+                continuous_features = [
+                    "tenure",
+                    "MonthlyCharges",
+                    "TotalCharges",          
+                    "AvgMonthlyCharge",
+                    "OnlineServiceCount",
+                    "AvgPricePerService",
+                ]
+    
+                features_to_vary = [
+                    "PhoneService","MultipleLines","OnlineSecurity","OnlineBackup",
+                    "DeviceProtection","TechSupport","StreamingTV","StreamingMovies",
+                    "PaperlessBilling","MonthlyCharges",
+                    "Contract_One year","Contract_Two year",
+                    "PaymentMethod_Credit card (automatic)","PaymentMethod_Electronic check","PaymentMethod_Mailed check",
+                    "InternetService_Fiber optic","InternetService_No",
+                ]
+    
+                results = get_counterfactual_analysis(
+                    y_test=y_test,
+                    X_test=scaled_X_test_features,
+                    X_train=scaled_X_train_features,
+                    y_train=y_train,
+                    model=lr_for_dice,                         # must expose predict_proba
+                    continuous_features=continuous_features,
+                    counterfactual_tab=counterfactual_tab,
+                    outcome_name="Churn",
+                    total_CFs=6,
+                    features_to_vary=features_to_vary,                    # or "all"
+                    permitted_range={"MonthlyCharges":[15,150]},
+                    scaler=scaler,
+                    numeric_feature_names_in_scaler_order=num_cols_in_scaler_order,
+                    immutable_features=immutable,
+                    onehot_groups=onehot_groups,
+                )
 
         elif selected_prediction_model == 'Random Forest':
             
@@ -1490,7 +1495,7 @@ if selected_dataset in datasets:
             #               "(should drop toward 0 if explanations depend on learned signal)")
 
 
-            # get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
+            get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
             xgb_local_shap_by_truth(bst, X_test_encoded, X_test, y_test, 0.58, shap_tab, background_data_encoded)
             get_lime_explanations_binary(bst, X_test, X_train_encoded, X_test_encoded, y_test, 0.58, lime_tab, title_prefix="Local LIME – XGBoost")
         
