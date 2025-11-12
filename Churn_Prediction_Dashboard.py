@@ -23,7 +23,7 @@ from src.logistic_regression import get_internet_lr_metrics_caption, get_telco_l
 from src.random_forest import get_internet_rf_metrics_caption, get_telco_rf_metrics_caption, display_rf_metrics, perform_primary_rf_training, cross_validate_rf_model, hyperparameter_tune_rf, retrain_rf_model
 from src.xgboost import get_internet_xgb_metrics_caption, get_telco_xgb_metrics_caption, display_xgb_metrics, perform_primary_xgb_training, cross_validate_xgb_model, xgb_random_search, xgb_grid_refine, retrain_xgb_model
 from sklearn.model_selection import StratifiedKFold
-from src.shap import (
+from src.shap_utils import (
     plot_precomputed_shap,
     get_lr_explanation, get_rf_explanation, get_xgb_explanation,
     lr_local_shap_by_truth, rf_local_shap_by_truth, xgb_local_shap_by_truth,
