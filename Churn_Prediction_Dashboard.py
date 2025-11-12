@@ -260,7 +260,7 @@ if selected_dataset in datasets:
             # cross_validate_lg_model(X_train_encoded, y_train, cross_validation, "balanced")
             # hyperparameter_tune_lg(X_train_encoded, y_train, cross_validation)
             metrics, tuned_model = retrain_lg_model(scaled_X_train_features, y_train, scaled_X_test_features, y_test, 0.5832, 0.00316)
-
+            logistic_regression_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.5832, reference=None)
             # def group_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.5832, reference=None):
             #     """Return a per-group fairness table and the chosen reference group."""
             #     # pick reference = largest group if not provided

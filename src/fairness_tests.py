@@ -1,16 +1,17 @@
 
-def logistic_regression_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.5832, reference=None):
+def logistic_regression_fairness_table(df, group_col, y_true, y_proba, threshold, reference):
     
-    """Return a per-group fairness table and the chosen reference group."""
-    # pick reference = largest group if not provided
-    ref = reference or df[group_col].value_counts().idxmax()
+    def group_fairness_table(df, group_col, y_true, y_proba, threshold, reference):
+        """Return a per-group fairness table and the chosen reference group."""
+        # pick reference = largest group if not provided
+        ref = reference or df[group_col].value_counts().idxmax()
 
-    def recall_pos(g):
-        mask = g[y_true] == 1
-        if mask.sum() == 0:
-            return np.nan
-        y_hat = (g[y_proba] >= threshold).astype(int)
-        return recall_score(g.loc[mask, y_true], y_hat[mask])
+        def recall_pos(g):
+            mask = g[y_true] == 1
+            if mask.sum() == 0:
+                return np.nan
+            y_hat = (g[y_proba] >= threshold).astype(int)
+            return recall_score(g.loc[mask, y_true], y_hat[mask])
 
         agg = (
             df.groupby(group_col)
@@ -53,14 +54,13 @@ def logistic_regression_fairness_table(df, group_col, y_true='y_true', y_proba='
     results = {}
     for name, model in models.items():
         # get probabilities for the positive class
-        y_proba = model.predict_proba(X_for_pred)[:, 1]
-
+        y_proba = model.predict_proba(X_for_pred)[:, 1
         # build evaluation frame aligned by index
         df_eval = X_test_original_groups.copy()
         df_eval["y_true"] = pd.Series(y_true.values, index=df_eval.index)
         df_eval["y_proba"] = pd.Series(y_proba, index=df_eval.index)
 
-        # per-group tables for this model
+    # per-group tables for this model
         model_tables = {}
         for gcol in group_cols:
             sub = df_eval[[gcol, "y_true", "y_proba"]].dropna()
@@ -72,3 +72,4 @@ def logistic_regression_fairness_table(df, group_col, y_true='y_true', y_proba='
 
     st.title("Fairness Evaluation — Group-Based Metrics")
     st.write("Global threshold for recall comparisons (equal opportunity): ", threshold)
+
