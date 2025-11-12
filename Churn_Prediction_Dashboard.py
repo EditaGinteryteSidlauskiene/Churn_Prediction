@@ -570,10 +570,11 @@ if selected_dataset in datasets:
         #     val_tab.markdown("### Sanity")
         #     val_tab.write(f"Spearman ρ vs original after label randomization: **{san['spearman_rho_vs_original']:.3f}** "
         #                   "(should drop toward 0 if explanations depend on learned signal)")
-
-            if shap_tab.button("Compute Logistic Regression Global SHAP explanation"):
+            global_button = shap_tab.button("Compute Logistic Regression Global SHAP explanation")
+            local_button = shap_tab.button("Compute Logistic Regression Local SHAP explanation")
+            if global_button:
                 get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
-            elif shap_tab.button("Compute Logistic Regression Local SHAP explanation"):
+            elif local_button:
                 lr_local_shap_by_truth(
                     lr_model=tuned_model,
                     background_data=background_data_scaled,
