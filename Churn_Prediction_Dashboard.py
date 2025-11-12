@@ -131,7 +131,7 @@ datasets = {
     # "Internet Dataset": internet_data
 }
 
-selected_dataset = st.sidebar.selectbox("Choose a dataset:", list(datasets.keys()))
+selected_dataset = st.sidebar.selectbox(list(datasets.keys()))
 
 # Display info of the selected dataset
 if selected_dataset in datasets:
