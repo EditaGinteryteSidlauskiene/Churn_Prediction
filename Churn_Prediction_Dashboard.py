@@ -140,11 +140,12 @@ if selected_dataset in datasets:
     st.markdown(f'##### {selected_dataset}')
     expander = st.expander('About this dataset')
     
-    # Display data explanation
-    if selected_dataset == 'Telco Dataset':
-        expander.write(get_telco_data_analysis())
-    elif selected_dataset == 'Internet Dataset':
-        expander.write(get_internet_data_analysis())
+    expander.write(get_telco_data_analysis())
+    # # Display data explanation
+    # if selected_dataset == 'Telco Dataset':
+    #     expander.write(get_telco_data_analysis())
+    # elif selected_dataset == 'Internet Dataset':
+    #     expander.write(get_internet_data_analysis())
 
     # Create four columns and get metrics
     data_info_col1, data_info_col2, data_info_col3, data_info_col4 = st.columns([1, 1, 1, 1])
