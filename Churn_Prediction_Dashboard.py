@@ -43,7 +43,6 @@ from scipy.stats import kendalltau, spearmanr
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils.validation import check_is_fitted
 import hashlib
-from src.fairness_tests import display_fairness_table_lr
 
 def _spearman_abs(a: np.ndarray, b: np.ndarray) -> float:
     """Spearman ρ between |a| and |b| (robust to sign)."""
