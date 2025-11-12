@@ -1,3 +1,9 @@
+import numpy as np
+import pandas as pd
+from io import StringIO
+import streamlit as st
+from sklearn.metrics import recall_score
+
 def display_fairness_table_lr(X_test, y_test, tuned_model, scaled_X_test_features, threshold):
     def group_fairness_table(df, group_col, threshold, y_true='y_true', y_proba='y_proba', reference=None):
         """Return a per-group fairness table and the chosen reference group."""
