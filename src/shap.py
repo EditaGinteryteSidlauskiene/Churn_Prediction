@@ -13,7 +13,7 @@ from scipy.special import expit
 from sklearn.metrics import roc_auc_score, auc
 from scipy.stats import spearmanr, kendalltau
 from joblib import Parallel, delayed
-from helpers_shap import load_shap
+from src.helpers_shap import load_shap
 
 def make_get_attribs_lr(lr_model, X_background, model_output="probability"):
     expl = shap.LinearExplainer(lr_model, X_background, model_output=model_output)
