@@ -13,7 +13,6 @@ from scipy.special import expit
 from sklearn.metrics import roc_auc_score, auc
 from scipy.stats import spearmanr, kendalltau
 from joblib import Parallel, delayed
-from src.helpers_shap import load_shap
 
 def make_get_attribs_lr(lr_model, X_background, model_output="probability"):
     expl = shap.LinearExplainer(lr_model, X_background, model_output=model_output)
@@ -45,52 +44,28 @@ def make_get_attribs_tree(model, X_background, model_output="probability"):
         return np.asarray(vals)
     return get_attribs
 
-def plot_precomputed_shap(
-    dataset: str,
-    model: str,
-    shap_tab,
-    run_id: str = "latest",
-    top_n: int = 15,
-    X_for_color: pd.DataFrame | None = None,  # pass scaled_X_test_features here
-):
 
-    # 1) Load cached SHAP arrays + metadata
-    shap_vals, base_vals, cols, idx = load_shap(dataset, model, run_id)
+def get_lr_explanation(lr_model, background_data, X_test_scaled, shap_tab, top_n=15):
 
-    # 2) DataFrames for SHAP and (optional) feature values
-    shap_df = pd.DataFrame(shap_vals, columns=cols, index=idx)
+    expl_lr = shap.LinearExplainer(lr_model, background_data, model_output="probability")
+    sv  = expl_lr(X_test_scaled)
 
-    if X_for_color is not None:
-        # Align rows/cols strictly to avoid mismatches
-        feat_df = X_for_color.reindex(index=shap_df.index, columns=shap_df.columns)
-    else:
-        feat_df = None
+    shap_vals = sv.values if hasattr(sv, "values") else sv
+    base_vals = sv.base_values if hasattr(sv, "base_values") else np.full(X_test_scaled.shape[0], shap_vals.mean())
 
-    # 3) Keep top_n features by mean |SHAP|
-    top_feats = (
-        shap_df.abs().mean(axis=0)
-        .sort_values(ascending=False)
-        .head(top_n)
-        .index
-    )
-    shap_top = shap_df[top_feats]
+    # --- Tidy long format for Plotly ---
+    shap_df = pd.DataFrame(shap_vals, columns=X_test_scaled.columns, index=X_test_scaled.index)
+    feat_df = X_test_scaled.copy()
 
-    # 4) Long/tidy format (and join feature values for color)
     long = (
-        shap_top.stack().rename("shap").to_frame()
+        shap_df.stack().rename("shap")
+        .to_frame()
+        .join(feat_df.stack().rename("value"))
         .reset_index()
         .rename(columns={"level_0": "row", "level_1": "feature"})
     )
 
-    if feat_df is not None:
-        vlong = (
-            feat_df[top_feats].stack().rename("value").to_frame()
-            .reset_index()
-            .rename(columns={"level_0": "row", "level_1": "feature"})
-        )
-        long = long.merge(vlong, on=["row", "feature"], how="left")
-
-    # 5) Order features by mean |SHAP|
+    # --- rank features by mean(|SHAP|) ---
     feat_order = (
         long.groupby("feature")["shap"]
             .apply(lambda s: s.abs().mean())
@@ -98,91 +73,30 @@ def plot_precomputed_shap(
             .index.tolist()
     )
 
-    # 6) Beeswarm (color by feature value if available)
-    if "value" in long.columns:
-        fig_beeswarm = px.strip(
-            long, x="shap", y="feature", color="value",
-            orientation="h",
-            hover_data={"row": True, "value": ":.3f", "shap": ":.4f"},
-            title=f"{dataset} · {model} — Global Feature Impact on Churn (precomputed)",
-        )
-        fig_beeswarm.update_layout(coloraxis_showscale=False)
-        # If your features are 0..1 scaled and you want same range:
-        # fig_beeswarm.update_layout(coloraxis=dict(cmin=0, cmax=1))
-    else:
-        fig_beeswarm = px.strip(
-            long, x="shap", y="feature",
-            orientation="h",
-            hover_data={"row": True, "shap": ":.4f"},
-            title=f"{dataset} · {model} — Global Feature Impact on Churn (precomputed)",
-        )
-
+    # --- 1) Beeswarm-like strip (direction + value color) ---
+    # Right = raises churn prob; Left = lowers churn prob
+    fig_beeswarm = px.strip(
+        long, x="shap", y="feature", color="value",
+        orientation="h",
+        hover_data={"row": True, "value": ":.3f", "shap": ":.4f"},
+        title="Global Feature Impact on Churn"
+    )
     fig_beeswarm.update_layout(yaxis=dict(categoryorder="array", categoryarray=feat_order))
     fig_beeswarm.update_traces(jitter=0.35, marker={"opacity": 0.55, "size": 4})
     fig_beeswarm.update_layout(
-        yaxis_title="Feature",
+        yaxis_title="Feature", 
         xaxis_title="Impact on churn probability",
-    )
+        coloraxis_showscale=False
+        )
+    fig_beeswarm.update_layout(coloraxis=dict(cmin=0, cmax=1))
 
     with shap_tab:
-        st.markdown("### Global Explanation")
-        c1, c2 = st.columns([2, 1])
-        c1.plotly_chart(fig_beeswarm, use_container_width=True)
+        st.markdown(
+                "### Global Explanation"
+            )
+        column1, column2 = st.columns([2, 1])
 
-
-
-# def get_lr_explanation(lr_model, background_data, X_test_scaled, shap_tab, top_n=15):
-
-#     expl_lr = shap.LinearExplainer(lr_model, background_data, model_output="probability")
-#     sv  = expl_lr(X_test_scaled)
-
-#     shap_vals = sv.values if hasattr(sv, "values") else sv
-#     base_vals = sv.base_values if hasattr(sv, "base_values") else np.full(X_test_scaled.shape[0], shap_vals.mean())
-
-#     # --- Tidy long format for Plotly ---
-#     shap_df = pd.DataFrame(shap_vals, columns=X_test_scaled.columns, index=X_test_scaled.index)
-#     feat_df = X_test_scaled.copy()
-
-#     long = (
-#         shap_df.stack().rename("shap")
-#         .to_frame()
-#         .join(feat_df.stack().rename("value"))
-#         .reset_index()
-#         .rename(columns={"level_0": "row", "level_1": "feature"})
-#     )
-
-#     # --- rank features by mean(|SHAP|) ---
-#     feat_order = (
-#         long.groupby("feature")["shap"]
-#             .apply(lambda s: s.abs().mean())
-#             .sort_values(ascending=True)
-#             .index.tolist()
-#     )
-
-#     # --- 1) Beeswarm-like strip (direction + value color) ---
-#     # Right = raises churn prob; Left = lowers churn prob
-#     fig_beeswarm = px.strip(
-#         long, x="shap", y="feature", color="value",
-#         orientation="h",
-#         hover_data={"row": True, "value": ":.3f", "shap": ":.4f"},
-#         title="Global Feature Impact on Churn"
-#     )
-#     fig_beeswarm.update_layout(yaxis=dict(categoryorder="array", categoryarray=feat_order))
-#     fig_beeswarm.update_traces(jitter=0.35, marker={"opacity": 0.55, "size": 4})
-#     fig_beeswarm.update_layout(
-#         yaxis_title="Feature", 
-#         xaxis_title="Impact on churn probability",
-#         coloraxis_showscale=False
-#         )
-#     fig_beeswarm.update_layout(coloraxis=dict(cmin=0, cmax=1))
-
-#     with shap_tab:
-#         st.markdown(
-#                 "### Global Explanation"
-#             )
-#         column1, column2 = st.columns([2, 1])
-
-#         column1.plotly_chart(fig_beeswarm)
+        column1.plotly_chart(fig_beeswarm)
 
 def collect_attributions_for_tests(
     *,
