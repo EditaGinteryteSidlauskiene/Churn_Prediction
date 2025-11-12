@@ -595,7 +595,7 @@ if selected_dataset in datasets:
 
             with counterfactual_tab:
                 if st.button("Compute Counterfactuals", key="btn_cf") or st.session_state.get("btn_cf"):
-                     lr_for_dice = ThresholdedModel(tuned_model, threshold=0.5832)
+                    lr_for_dice = ThresholdedModel(tuned_model, threshold=0.5832)
     
                     continuous_features = [
                         "tenure",
@@ -605,7 +605,7 @@ if selected_dataset in datasets:
                         "OnlineServiceCount",
                         "AvgPricePerService",
                     ]
-        
+
                     features_to_vary = [
                         "PhoneService","MultipleLines","OnlineSecurity","OnlineBackup",
                         "DeviceProtection","TechSupport","StreamingTV","StreamingMovies",
@@ -614,7 +614,7 @@ if selected_dataset in datasets:
                         "PaymentMethod_Credit card (automatic)","PaymentMethod_Electronic check","PaymentMethod_Mailed check",
                         "InternetService_Fiber optic","InternetService_No",
                     ]
-        
+
                     results = get_counterfactual_analysis(
                         y_test=y_test,
                         X_test=scaled_X_test_features,
