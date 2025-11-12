@@ -3311,7 +3311,7 @@ if selected_dataset in datasets:
 #         ' and StreamingMovies (small negative).')
 
 
-display_fairness_table_lr(df, group_col, y_true, y_proba, threshold, reference):
+def display_fairness_table_lr(df, group_col, y_true, y_proba, threshold, reference):
     def group_fairness_table(df, group_col, y_true, y_proba, threshold, reference):
         """Return a per-group fairness table and the chosen reference group."""
         # pick reference = largest group if not provided
