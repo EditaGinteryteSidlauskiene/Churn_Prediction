@@ -1768,7 +1768,7 @@ if selected_dataset in datasets:
                 xgb_clf=None,
                 X_train_enc=None,
                 X_val_enc=None,
-"""Streamlit entry point for the churn prediction dashboard."""
+# Streamlit entry point for the churn prediction dashboard.
 
                 xgb_booster=None,
                 use_streamlit=True
