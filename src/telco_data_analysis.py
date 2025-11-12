@@ -10,6 +10,31 @@ color_map = {
     'No': "#314A31"
 }
 
+def display_select_boxes():
+    selected_anaysis_type = st.sidebar.selectbox(
+        options=[
+            'Choose Analysis Type', 
+            'Numeric Drivers of Churn', 
+            'Categorical Drivers of Churn',
+            'Service Engagement and Churn',
+            'Demographic Drivers of Churn',
+            'Correlations and Interactions'],
+        label='Choose Analysis Type',
+        label_visibility='collapsed',
+        index=0
+        )
+
+        selected_prediction_model = st.sidebar.selectbox(
+        options=[
+            'Choose Prediction Model', 
+            'Logistic Regression', 
+            'Random Forest',
+            'XGBoost'],
+        label='Choose Prediction Model',
+        label_visibility='collapsed',
+        index=0
+        )
+
 def get_telco_data_analysis():
     """
     Provides a concise textual summary of the Techo Customer Churn dataset.
