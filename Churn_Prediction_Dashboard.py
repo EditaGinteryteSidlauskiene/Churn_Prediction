@@ -260,7 +260,7 @@ if selected_dataset in datasets:
             # cross_validate_lg_model(X_train_encoded, y_train, cross_validation, "balanced")
             # hyperparameter_tune_lg(X_train_encoded, y_train, cross_validation)
             metrics, tuned_model = retrain_lg_model(scaled_X_train_features, y_train, scaled_X_test_features, y_test, 0.5832, 0.00316)
-            display_fairness_table_lr(X_test, tuned_model, scaled_X_test_features, threshold=0.5832)
+            display_fairness_table_lr(X_test, tuned_model, scaled_X_test_features, 0.5832)
             
 
             st.subheader("Logistic Regression Performance Analysis")
@@ -3325,7 +3325,7 @@ def display_fairness_table_lr(X_test, tuned_model, scaled_X_test_features, thres
         return agg.sort_values('n', ascending=False), ref
 
     group_cols = ["gender", "SeniorCitizen", "Partner", "Dependents", "Contract", "PaymentMethod", "InternetService", "PaperlessBilling"]  
-    threshold = 0.5832
+  
     X_test_original_groups = X_test[group_cols].copy()
     if hasattr(y_test, "dtype") and y_test.dtype == object:
         y_true = y_test.map({"No": 0, "Yes": 1}).astype(int)
