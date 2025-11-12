@@ -542,7 +542,7 @@ def display_xgb_metrics(metrics_tab, metrics):
 
     with metrics_tab:
         st.markdown("#### Metrics")
-        st.dataframe(df.round(3), use_container_width=True, hide_index=True)
+        st.dataframe(df.round(3), width='stretch', hide_index=True)
 
         # ---------- Confusion matrix ----------
         cm_fig = metrics.get("Confusion matrix", None)

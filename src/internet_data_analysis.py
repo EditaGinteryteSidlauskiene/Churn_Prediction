@@ -315,7 +315,7 @@ def show_internet_categorical_drivers(dataset):
     fig.update_yaxes(tickformat=",")  # comma separators like 1,000
 
     categorical1_col, categorical2_col = st.columns([1, 1])
-    categorical1_col.plotly_chart(fig, use_container_width=True)
+    categorical1_col.plotly_chart(fig, width='stretch')
 
     # --- 2) Prepare churn labels ---
     churn_label = {0: "No", 1: "Yes"}
@@ -352,7 +352,7 @@ def show_internet_categorical_drivers(dataset):
         legend_title_text="Churn",
     )
     fig.update_yaxes(tickformat=",")
-    categorical2_col.plotly_chart(fig, use_container_width=True)
+    categorical2_col.plotly_chart(fig, width='stretch')
 
     categorical1_caption_col, categorical2_caption_col = st.columns([1, 1])
     categorical1_caption_col.caption(body='Customers without a contract exhibit the highest churn, while churn rates ' \
@@ -396,7 +396,7 @@ def show_internet_categorical_drivers(dataset):
     fig.update_yaxes(tickformat=",")
 
     categorical3_col, categorical4_col = st.columns([1, 1])
-    categorical3_col.plotly_chart(fig, use_container_width=True)
+    categorical3_col.plotly_chart(fig, width='stretch')
 
     counts = (dataset.groupby(["fail_count_bucket", "churn_str"], observed=True)
                  .size().reset_index(name="n"))
@@ -420,7 +420,7 @@ def show_internet_categorical_drivers(dataset):
     )
 
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=["0", "1", "2–3", "4+"])
-    categorical4_col.plotly_chart(fig, use_container_width=True)
+    categorical4_col.plotly_chart(fig, width='stretch')
 
     categorical3_caption_col, categorical4_caption_col = st.columns([1, 1])
     categorical3_caption_col.caption(body='Light users show the highest churn rate, suggesting ' \

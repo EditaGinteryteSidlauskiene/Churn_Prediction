@@ -338,7 +338,7 @@ if selected_dataset in datasets:
             #     with st.expander(f"Model: {model_name}", expanded=False):
             #         for gcol, (table, ref) in tables.items():
             #             st.subheader(f"Group column: {gcol} (ref: {ref})")
-            #             st.dataframe(table, use_container_width=True)
+            #             st.dataframe(table, width='stretch')
 
             #             # CSV download
             #             csv_buf = StringIO()
@@ -705,7 +705,7 @@ if selected_dataset in datasets:
             #     with st.expander(f"Model: {model_name}", expanded=False):
             #         for gcol, (table, ref) in tables.items():
             #             st.subheader(f"Group column: {gcol} (ref: {ref})")
-            #             st.dataframe(table, use_container_width=True)
+            #             st.dataframe(table, width='stretch')
 
             #             # CSV download
             #             csv_buf = StringIO()
@@ -1213,7 +1213,7 @@ if selected_dataset in datasets:
             #     with st.expander(f"Model: {model_name}", expanded=False):
             #         for gcol, (table, ref) in tables.items():
             #             st.subheader(f"Group column: {gcol} (ref: {ref})")
-            #             st.dataframe(table, use_container_width=True)
+            #             st.dataframe(table, width='stretch')
             #             csv_buf = StringIO()
             #             table.to_csv(csv_buf, index=False)
             #             st.download_button(
@@ -1725,7 +1725,7 @@ if selected_dataset in datasets:
             #     with st.expander(f"Model: {model_name}", expanded=False):
             #         for gcol, (table, ref) in tables.items():
             #             st.subheader(f"Group column: {gcol} (ref: {ref})")
-            #             st.dataframe(table, use_container_width=True)
+            #             st.dataframe(table, width='stretch')
 
             #             # CSV download
             #             csv_buf = StringIO()
@@ -2166,7 +2166,7 @@ if selected_dataset in datasets:
             #     with st.expander(f"Model: {model_name}", expanded=False):
             #         for gcol, (table, ref) in tables.items():
             #             st.subheader(f"Group column: {gcol} (ref: {ref})")
-            #             st.dataframe(table, use_container_width=True)
+            #             st.dataframe(table, width='stretch')
 
             #             # CSV download
             #             csv_buf = StringIO()
@@ -2730,7 +2730,7 @@ if selected_dataset in datasets:
             #     with st.expander(f"Model: {model_name}", expanded=False):
             #         for gcol, (table, ref) in tables.items():
             #             st.subheader(f"Group column: {gcol} (ref: {ref})")
-            #             st.dataframe(table, use_container_width=True)
+            #             st.dataframe(table, width='stretch')
             #             csv_buf = StringIO()
             #             table.to_csv(csv_buf, index=False)
             #             st.download_button(

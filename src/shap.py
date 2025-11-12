@@ -491,7 +491,7 @@ def lr_local_shap_by_truth(
             if value_format:
                 # only apply provided formats to columns that exist in the table
                 fmt.update({k: v for k, v in value_format.items() if k in df_top.columns})
-            local_col1.dataframe(df_top.style.format(fmt), use_container_width=True)
+            local_col1.dataframe(df_top.style.format(fmt), width='stretch')
 
             # --- Plotly Express contribution bar (built directly from SHAP 'top')
             df_bar = pd.DataFrame({
@@ -523,7 +523,7 @@ def lr_local_shap_by_truth(
                                text=f"pred≈{pred_from_shap:.3f}",
                                showarrow=False, yref="y domain")
 
-            local_col3.plotly_chart(fig, use_container_width=True)
+            local_col3.plotly_chart(fig, width='stretch')
 
 @st.cache_resource
 def _make_tree_explainer(_model, X_bg):   # <- underscore = don't hash
@@ -618,7 +618,7 @@ def get_rf_explanation(
                 "### Global Explanation"
             )
         c1, c2 = st.columns([2, 1])
-        c1.plotly_chart(fig_beeswarm, use_container_width=True)
+        c1.plotly_chart(fig_beeswarm, width='stretch')
 
     return fig_beeswarm
 
@@ -695,7 +695,7 @@ def rf_local_shap_by_truth(
             fmt = {}
             if value_format:
                 fmt.update({k: v for k, v in value_format.items() if k in df_top.columns})
-            local_col1.dataframe(df_top.style.format(fmt), use_container_width=True)
+            local_col1.dataframe(df_top.style.format(fmt), width='stretch')
 
             # --- Contribution bar chart in RAW units (Δ log-odds)
             df_bar = pd.DataFrame({
@@ -727,7 +727,7 @@ def rf_local_shap_by_truth(
                                text=f"sum(raw)≈{pred_raw_from_shap:.3f}",
                                showarrow=False, yref="y domain")
 
-            local_col2.plotly_chart(fig, use_container_width=True)
+            local_col2.plotly_chart(fig, width='stretch')
 
 def _normalize_base_score_value(val):
     # Accept strings like "[5E-1]" / "[0.5]" / "0.5" / "5e-1"
@@ -903,7 +903,7 @@ def get_xgb_explanation(xgb_model, X_background, X_test, shap_tab, top_n=15):
     with shap_tab:
         st.markdown("### Global Explanation")
         col1, col2 = st.columns([2, 1])
-        col1.plotly_chart(fig_beeswarm, use_container_width=True)
+        col1.plotly_chart(fig_beeswarm, width='stretch')
 
 
 def _patch_base_score_in_modelfile(booster: xgb.Booster) -> xgb.Booster:
@@ -1063,7 +1063,7 @@ def xgb_local_shap_by_truth(
             fmt = {}
             if value_format:
                 fmt.update({k: v for k, v in value_format.items() if k in df_top.columns})
-            local_col1.dataframe(df_top.style.format(fmt), use_container_width=True)
+            local_col1.dataframe(df_top.style.format(fmt), width='stretch')
 
             # Bar chart in Δ log-odds
             df_bar = pd.DataFrame({
@@ -1095,7 +1095,7 @@ def xgb_local_shap_by_truth(
                                text=f"sum(raw)≈{raw_sum:.3f} (p≈{expit(raw_sum):.3f})",
                                showarrow=False, yref="y domain")
 
-            local_col2.plotly_chart(fig, use_container_width=True)
+            local_col2.plotly_chart(fig, width='stretch')
 
 
 def _normalize_to_en_dash(name: str) -> str:

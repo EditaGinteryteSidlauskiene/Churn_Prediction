@@ -264,7 +264,7 @@ def get_lime_explanations_binary(
             fmt = {}
             if value_format:
                 fmt.update({k: v for k, v in value_format.items() if k in df_top.columns})
-            local_col1.dataframe(df_top.style.format(fmt), use_container_width=True)
+            local_col1.dataframe(df_top.style.format(fmt), width='stretch')
           
             df_bar = pd.DataFrame({
                 "feature": feat_list + (["other"] if other != 0 else []),
@@ -282,7 +282,7 @@ def get_lime_explanations_binary(
                 showlegend=False
             )
             fig.add_vline(x=0, line_width=1, line_dash="dash", opacity=0.6)
-            local_col2.plotly_chart(fig, use_container_width=True)
+            local_col2.plotly_chart(fig, width='stretch')
 
 def lime_xgb_local_rank_vs_impact(
     explainer,
