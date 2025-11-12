@@ -573,7 +573,7 @@ if selected_dataset in datasets:
 
             if shap_tab.button("Compute Logistic Regression Global SHAP explanation"):
                 get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
-            elif if shap_tab.button("Compute Logistic Regression Local SHAP explanation"):
+            elif shap_tab.button("Compute Logistic Regression Local SHAP explanation"):
                 lr_local_shap_by_truth(
                     lr_model=tuned_model,
                     background_data=background_data_scaled,
