@@ -165,7 +165,7 @@ if selected_dataset in datasets:
         
     if selected_dataset == 'Telco Dataset':
 
-        display_select_boxes()
+        display_select_boxes(sidebar)
         
         #---------------   Cleaning telco data ------------------------
         telco_data['TotalCharges'] = convert_str_to_numeric(telco_data['TotalCharges'])

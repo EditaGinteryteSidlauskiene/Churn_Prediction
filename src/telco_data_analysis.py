@@ -10,7 +10,7 @@ color_map = {
     'No': "#314A31"
 }
 
-def display_select_boxes():
+def display_select_boxes(sidebar):
     selected_anaysis_type = st.sidebar.selectbox(
         options=[
             'Choose Analysis Type', 
