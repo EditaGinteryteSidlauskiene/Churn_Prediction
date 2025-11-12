@@ -1,230 +1,322 @@
-from sklearn.linear_model import LogisticRegression
-import streamlit as st
-from sklearn.metrics import (
-    make_scorer, precision_recall_curve,
-    classification_report, roc_auc_score, confusion_matrix,
-    balanced_accuracy_score, precision_score, recall_score, f1_score
-)
-from sklearn.model_selection import StratifiedKFold, cross_validate
-import pandas as pd
+"""Utility helpers to train and report Logistic Regression churn models.
+
+The original module grew organically and ended up with repeated snippets of
+code (for instance model creation, metric calculation and index helpers).
+This refactor centralises the common logic, adds docstrings, and sprinkles in
+inline comments so future contributors can follow the training flow more
+easily.
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional, Sequence, Tuple
+
 import numpy as np
+import pandas as pd
+import streamlit as st
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.preprocessing import StandardScaler
-import altair as alt
+
 from src.helper import render_confusion_matrix
 
 
-def perform_primary_lg_training(scaled_X_train, y_train, scaled_X_test, y_test, class_weight, pos_label=1):
-   # Model
-    log_reg = LogisticRegression(
-        max_iter=1000,
-        random_state=42,
-        solver="lbfgs",
-        class_weight=class_weight
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+DEFAULT_RANDOM_STATE = 42
+
+
+def _index_like(source: Sequence, idx: Sequence[int]):
+    """Return items by index for both numpy/pandas containers."""
+
+    return source.iloc[idx] if hasattr(source, "iloc") else source[idx]
+
+
+def _build_logistic_regression(
+    *,
+    C: float = 1.0,
+    class_weight: Optional[str | dict] = None,
+    solver: str = "lbfgs",
+    max_iter: int = 1000,
+    random_state: int = DEFAULT_RANDOM_STATE,
+) -> LogisticRegression:
+    """Create a Logistic Regression instance with the project defaults."""
+
+    return LogisticRegression(
+        C=C,
+        class_weight=class_weight,
+        solver=solver,
+        max_iter=max_iter,
+        random_state=random_state,
     )
-    log_reg.fit(scaled_X_train, y_train)
 
-    # Predictions
-    y_pred = log_reg.predict(scaled_X_test)
-    y_proba = log_reg.predict_proba(scaled_X_test)[:, 1]  # for ROC–AUC
 
-    # Metrics (focus on the positive class = churn)
-    acc = (y_pred == y_test).mean()
-    prec_pos = precision_score(y_test, y_pred, pos_label=pos_label, zero_division=0)
-    rec_pos  = recall_score(y_test, y_pred, pos_label=pos_label, zero_division=0)
-    f1_pos   = f1_score(y_test, y_pred, pos_label=pos_label, zero_division=0)
-    roc_auc  = roc_auc_score(y_test, y_proba)
-    bal_acc  = balanced_accuracy_score(y_test, y_pred)
+def _scale_fold(
+    X_train: Sequence,
+    X_test: Sequence,
+    *,
+    sparse_input: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Scale train/test splits using a fold-specific standard scaler."""
 
-    # Optional: confusion matrix if you want to report it
-    # confusion_matrix = confusion_matrix(y_test, y_pred, labels=[pos_label, 1 - pos_label])
+    scaler = StandardScaler(with_mean=not sparse_input)
+    X_tr = scaler.fit_transform(X_train)
+    X_ts = scaler.transform(X_test)
+    return X_tr, X_ts
 
-    # Return a neat dict/row for your table
-    row = {
-        "Model": "Logistic Regression",
-        "Accuracy": acc,
-        "Precision": prec_pos,
-        "Recall": rec_pos,
-        "F1-score": f1_pos,
-        "ROC-AUC": roc_auc,
-        "Balanced Acc.": bal_acc
+
+def _classification_metrics(
+    *,
+    y_true: Sequence[int],
+    y_pred: Sequence[int],
+    y_proba: Sequence[float],
+    pos_label: int = 1,
+):
+    """Return a consistent dictionary of the classification metrics we report."""
+
+    return {
+        "accuracy": float((y_pred == y_true).mean()),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "precision": float(
+            precision_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
+        ),
+        "recall": float(recall_score(y_true, y_pred, pos_label=pos_label, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, pos_label=pos_label, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_true, y_proba)),
     }
 
-    # Nicely formatted printout
+def perform_primary_lg_training(
+    scaled_X_train,
+    y_train,
+    scaled_X_test,
+    y_test,
+    class_weight,
+    pos_label: int = 1,
+):
+    """Fit the baseline Logistic Regression model and report the main metrics."""
+
+    model = _build_logistic_regression(class_weight=class_weight)
+    model.fit(scaled_X_train, y_train)
+
+    # Inference on the provided evaluation split
+    y_pred = model.predict(scaled_X_test)
+    y_proba = model.predict_proba(scaled_X_test)[:, 1]
+
+    metrics = {
+        "Model": "Logistic Regression",
+        "Accuracy": float((y_pred == y_test).mean()),
+        "Precision": float(
+            precision_score(y_test, y_pred, pos_label=pos_label, zero_division=0)
+        ),
+        "Recall": float(recall_score(y_test, y_pred, pos_label=pos_label, zero_division=0)),
+        "F1-score": float(f1_score(y_test, y_pred, pos_label=pos_label, zero_division=0)),
+        "ROC-AUC": float(roc_auc_score(y_test, y_proba)),
+        "Balanced Acc.": float(balanced_accuracy_score(y_test, y_pred)),
+    }
+
     print("\nLogistic Regression Model Evaluation")
     print("-" * 55)
-    for key, value in row.items():
+    for key, value in metrics.items():
         print(f"{key:<15}: {value}")
     print("-" * 55)
 
-def cross_validate_lg_model(X, y, cv, class_weight, *, pos_label=1,sparse_input=False):
-    """
-    Cross-validate Logistic Regression with churn-centric scorers.
-    Returns a DataFrame (metric, mean, std) and prints a tidy summary.
-    """
 
-    def _ix(A, idx):
-        return A.iloc[idx] if hasattr(A, "iloc") else A[idx]
-    
+def cross_validate_lg_model(
+    X,
+    y,
+    cv,
+    class_weight,
+    *,
+    pos_label: int = 1,
+    sparse_input: bool = False,
+):
+    """Cross-validate Logistic Regression with churn-centric scorers."""
+
     records = []
-    k = cv.get_n_splits(X, y)  # derive k from the provided splitter
+    for fold, (tr_idx, te_idx) in enumerate(cv.split(X, y), start=1):
+        X_tr_full, X_te = _index_like(X, tr_idx), _index_like(X, te_idx)
+        y_tr_full, y_te = _index_like(y, tr_idx), _index_like(y, te_idx)
 
-    fold = 0
-    for tr_idx, te_idx in cv.split(X, y):
-        fold += 1
-        X_tr_full, X_te = _ix(X, tr_idx), _ix(X, te_idx)
-        y_tr_full, y_te = _ix(y, tr_idx), _ix(y, te_idx)
+        X_tr, X_ts = _scale_fold(X_tr_full, X_te, sparse_input=sparse_input)
 
-        scaler = StandardScaler(with_mean=not sparse_input)
-        X_tr = scaler.fit_transform(X_tr_full)  # fit on train fold only
-        X_ts = scaler.transform(X_te)
-            
+        model = _build_logistic_regression(class_weight=class_weight)
+        model.fit(X_tr, y_tr_full)
 
-        lr = LogisticRegression(
-                max_iter=1000, solver="lbfgs", class_weight=class_weight, random_state=42
-            )
+        y_pred = model.predict(X_ts)
+        y_proba = model.predict_proba(X_ts)[:, 1]
 
-        lr.fit(X_tr, y_tr_full)
-
-        y_pred  = lr.predict(X_ts)
-        y_proba = lr.predict_proba(X_ts)[:, 1]
-
-        records.append({
-            "fold": fold,
-            "accuracy":            float((y_pred == y_te).mean()),
-            "balanced_accuracy":   float(balanced_accuracy_score(y_te, y_pred)),
-            "precision":           float(precision_score(y_te, y_pred, pos_label=pos_label, zero_division=0)),
-            "recall":              float(recall_score(y_te, y_pred, pos_label=pos_label, zero_division=0)),
-            "f1":                  float(f1_score(y_te, y_pred, pos_label=pos_label, zero_division=0)),
-            "roc_auc":             float(roc_auc_score(y_te, y_proba)),
-        })
+        records.append(
+            {
+                "fold": fold,
+                **_classification_metrics(
+                    y_true=y_te, y_pred=y_pred, y_proba=y_proba, pos_label=pos_label
+                ),
+            }
+        )
 
     per_fold = pd.DataFrame(records)
     metrics = ["accuracy", "balanced_accuracy", "precision", "recall", "f1", "roc_auc"]
-    summary = (per_fold[metrics].agg(["mean", "std"]).T
-               .reset_index().rename(columns={"index": "metric"})
-               .sort_values("metric"))
-    
-    print(f"\nLogistic Regression Cross-Validation (k={k}, per-fold scaling, no Pipeline)")
+    summary = (
+        per_fold[metrics]
+        .agg(["mean", "std"])
+        .T.reset_index()
+        .rename(columns={"index": "metric"})
+        .sort_values("metric")
+    )
+
+    print(
+        f"\nLogistic Regression Cross-Validation (k={cv.get_n_splits(X, y)}, per-fold scaling, no Pipeline)"
+    )
     print("-" * 70)
     for _, r in summary.iterrows():
         print(f"{r['metric']:<20}: {r['mean']:.3f} ± {r['std']:.3f}")
     print("-" * 70)
 
-def _ix(A, idx):
-    return A.iloc[idx] if hasattr(A, "iloc") else A[idx]
 
-def hyperparameter_tune_lg(X, y, cv, *,                                # required StratifiedKFold (reuse across models)
-    C_grid=None,                       # e.g., np.logspace(-3, 3, 13)
+def hyperparameter_tune_lg(
+    X,
+    y,
+    cv,
+    *,
+    C_grid=None,
     class_weight_grid=(None, "balanced"),
-    pos_label=1,
-    sparse_input=False,                # True if X is sparse one-hot
-    max_iter=2000,
-    solver="lbfgs",
-    scoring="f1"):
-    C_grid = np.logspace(-3, 3, 13)  # 1e-3 … 1e3
-    """
-    Manual grid search for Logistic Regression WITHOUT Pipeline.
-    - Scales inside each fold (fit on train, transform train & val).
-    - Optimizes a chosen scorer on the validation fold.
-    - Returns best_params, best_cv_score, and a per-config summary DataFrame.
-    """
+    pos_label: int = 1,
+    sparse_input: bool = False,
+    max_iter: int = 2000,
+    solver: str = "lbfgs",
+    scoring: str = "f1",
+):
+    """Manual grid search for Logistic Regression without scikit-learn Pipelines."""
+
     if C_grid is None:
         C_grid = np.logspace(-3, 3, 13)
 
     def score_fold(y_true, y_pred, y_proba):
         if scoring == "f1":
             return f1_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
-        elif scoring == "recall":
+        if scoring == "recall":
             return recall_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
-        elif scoring == "precision":
+        if scoring == "precision":
             return precision_score(y_true, y_pred, pos_label=pos_label, zero_division=0)
-        elif scoring == "roc_auc":
+        if scoring == "roc_auc":
             return roc_auc_score(y_true, y_proba)
-        else:
-            raise ValueError(f"Unsupported scoring='{scoring}'")
-    
+        raise ValueError(f"Unsupported scoring='{scoring}'")
+
     records = []
     best_score = -np.inf
     best_params = None
     best_threshold_median = None
     best_thresholds_per_fold = None
-    # iterate grid
+
     for C in C_grid:
         for cw in class_weight_grid:
-            fold_scores = []
+            fold_scores: List[float] = []
             fold_metrics = []
             fold_thresholds = []
 
             for tr_idx, va_idx in cv.split(X, y):
-                X_tr_full, X_va = _ix(X, tr_idx), _ix(X, va_idx)
-                y_tr, y_va = _ix(y, tr_idx), _ix(y, va_idx)
-                # scale INSIDE the fold (no leakage)
-                scaler = StandardScaler(with_mean=not sparse_input)
-                X_tr = scaler.fit_transform(X_tr_full)
-                X_v  = scaler.transform(X_va)
-                # fit LR
-                lr = LogisticRegression(
-                    C=C, class_weight=cw, solver=solver, max_iter=max_iter, random_state=42
+                X_tr_full, X_va = _index_like(X, tr_idx), _index_like(X, va_idx)
+                y_tr, y_va = _index_like(y, tr_idx), _index_like(y, va_idx)
+
+                X_tr, X_v = _scale_fold(X_tr_full, X_va, sparse_input=sparse_input)
+
+                model = _build_logistic_regression(
+                    C=C,
+                    class_weight=cw,
+                    solver=solver,
+                    max_iter=max_iter,
                 )
-                lr.fit(X_tr, y_tr)
-                # predict
-                y_pred  = lr.predict(X_v)
-                y_proba = lr.predict_proba(X_v)[:, 1]
+                model.fit(X_tr, y_tr)
 
-                thr, f1_at_thr = best_threshold_for_f1(y_va, y_proba, pos_label=pos_label)
+                y_pred = model.predict(X_v)
+                y_proba = model.predict_proba(X_v)[:, 1]
+
+                thr, _ = best_threshold_for_f1(y_va, y_proba, pos_label=pos_label)
                 y_pred = (y_proba >= thr).astype(int)
-                s = f1_at_thr  # use improved F1 as the fold score
                 fold_thresholds.append(thr)
-                
-                # primary score for model selection
-                s = score_fold(y_va, y_pred, y_proba)
-                fold_scores.append(s)
-                # collect extra metrics (optional, helpful to inspect trade-offs)
-                fold_metrics.append({
-                    "accuracy":           float((y_pred == y_va).mean()),
-                    "balanced_accuracy":  float(balanced_accuracy_score(y_va, y_pred)),
-                    "precision":          float(precision_score(y_va, y_pred, pos_label=pos_label, zero_division=0)),
-                    "recall":             float(recall_score(y_va, y_pred, pos_label=pos_label, zero_division=0)),
-                    "f1":                 float(f1_score(y_va, y_pred, pos_label=pos_label, zero_division=0)),
-                    "roc_auc":            float(roc_auc_score(y_va, y_proba)),
-                })
-            mean_score = float(np.mean(fold_scores))
-            std_score  = float(np.std(fold_scores))
-            mean_thr   = float(np.median(fold_thresholds)) if (scoring == "f1" and fold_thresholds) else None
 
-            # aggregate extra metrics (mean across folds)
-            extra_df = pd.DataFrame(fold_metrics)
-            extras_mean = extra_df.mean().to_dict()
-            records.append({
-                "C": C,
-                "class_weight": cw,
-                "cv_score_mean": mean_score,
-                "cv_score_std": std_score,
-                "opt_threshold_median": mean_thr,
-                **{f"mean_{k}": float(v) for k, v in extras_mean.items()}
-            })
+                fold_scores.append(score_fold(y_va, y_pred, y_proba))
+                fold_metrics.append(
+                    _classification_metrics(
+                        y_true=y_va,
+                        y_pred=y_pred,
+                        y_proba=y_proba,
+                        pos_label=pos_label,
+                    )
+                )
+
+            mean_score = float(np.mean(fold_scores))
+            std_score = float(np.std(fold_scores))
+            mean_thr = (
+                float(np.median(fold_thresholds))
+                if scoring == "f1" and fold_thresholds
+                else None
+            )
+
+            extras_mean = pd.DataFrame(fold_metrics).mean().to_dict()
+            records.append(
+                {
+                    "C": C,
+                    "class_weight": cw,
+                    "cv_score_mean": mean_score,
+                    "cv_score_std": std_score,
+                    "opt_threshold_median": mean_thr,
+                    **{f"mean_{k}": float(v) for k, v in extras_mean.items()},
+                }
+            )
+
             if mean_score > best_score:
                 best_score = mean_score
                 best_params = {"C": C, "class_weight": cw}
-
                 best_threshold_median = mean_thr
                 best_thresholds_per_fold = list(fold_thresholds)
 
-    summary = pd.DataFrame(records).sort_values("cv_score_mean", ascending=False).reset_index(drop=True)
+    summary = (
+        pd.DataFrame(records)
+        .sort_values("cv_score_mean", ascending=False)
+        .reset_index(drop=True)
+    )
 
-    # pretty print top rows
-    print(f"\nLogistic Regression manual grid (scoring='{scoring}', folds={cv.get_n_splits()})")
+    print(
+        f"\nLogistic Regression manual grid (scoring='{scoring}', folds={cv.get_n_splits()})"
+    )
     print("Top configs:")
-    display_cols = ["C", "class_weight", "cv_score_mean", "cv_score_std",
-                    "mean_precision", "mean_recall", "mean_f1", "mean_balanced_accuracy", "mean_roc_auc"]
+    display_cols = [
+        "C",
+        "class_weight",
+        "cv_score_mean",
+        "cv_score_std",
+        "mean_precision",
+        "mean_recall",
+        "mean_f1",
+        "mean_balanced_accuracy",
+        "mean_roc_auc",
+    ]
     print(summary[display_cols].head(10).to_string(index=False))
     print("\nBest params:", best_params)
     print(f"Best CV {scoring}: {best_score:.3f}")
     if best_threshold_median is not None:
-        print(f"Chosen threshold (median across folds) for best params: {best_threshold_median:.4f}")
-        print(f"Per-fold thresholds (best params): {[f'{t:.4f}' for t in best_thresholds_per_fold]}")
+        print(
+            "Chosen threshold (median across folds) for best params: "
+            f"{best_threshold_median:.4f}"
+        )
+        print(
+            "Per-fold thresholds (best params): "
+            f"{[f'{t:.4f}' for t in best_thresholds_per_fold]}"
+        )
 
 def best_threshold_for_f1(y_true, y_scores, pos_label=1):
+    """Return the threshold that maximises F1 on the provided scores."""
+
     # PR curve: p, r length = n_thr+1 ; t length = n_thr
     p, r, t = precision_recall_curve(y_true == pos_label, y_scores)
 
@@ -244,48 +336,65 @@ def best_threshold_for_f1(y_true, y_scores, pos_label=1):
     return float(t[i]), float(f1[i])
 
 def retrain_lg_model(
-    X_train, y_train, X_test, y_test, 
-    threshold, C, *, 
-    class_weight="balanced", pos_label=1, n_splits=5, max_iter=2000, random_state=42
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    threshold,
+    C,
+    *,
+    class_weight="balanced",
+    pos_label=1,
+    n_splits=5,
+    max_iter=2000,
+    random_state=42,
 ):
-    # 2) Refit on all training data with tuned hyperparams
-    lr = LogisticRegression(
-        C=C, class_weight=class_weight, solver="lbfgs",
-        max_iter=max_iter, random_state=random_state
+    """Retrain Logistic Regression with tuned hyperparameters and threshold.
+
+    The ``n_splits`` parameter is kept for backwards compatibility with the
+    previous signature even though the implementation does not use it directly.
+    """
+
+    model = _build_logistic_regression(
+        C=C,
+        class_weight=class_weight,
+        solver="lbfgs",
+        max_iter=max_iter,
+        random_state=random_state,
     )
-    lr.fit(X_train, y_train)
+    model.fit(X_train, y_train)
 
-    # 3) Evaluate on test with the chosen operating threshold
-    y_proba = lr.predict_proba(X_test)[:, 1]
-    y_pred  = (y_proba >= threshold).astype(int)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    y_pred = (y_proba >= threshold).astype(int)
 
-    # Render CM at tuned threshold
     cm_fig = render_confusion_matrix(
         y_true=y_test, y_proba=y_proba, threshold=threshold
     )
 
-    acc     = (y_pred == y_test).mean()
-    prec    = precision_score(y_test, y_pred, pos_label=pos_label, zero_division=0)
-    rec     = recall_score(y_test, y_pred, pos_label=pos_label, zero_division=0)
-    f1      = f1_score(y_test, y_pred, pos_label=pos_label, zero_division=0)
-    rocauc  = roc_auc_score(y_test, y_proba)
-    bal_acc = balanced_accuracy_score(y_test, y_pred)
+    classification = _classification_metrics(
+        y_true=y_test, y_pred=y_pred, y_proba=y_proba, pos_label=pos_label
+    )
 
-    return {
+    metrics = {
         "Confusion matrix": cm_fig,
         "Model": "Logistic Regression",
         "C": C,
         "class_weight": class_weight,
         "Threshold": threshold,
-        "Accuracy": acc,
-        "Precision": prec,
-        "Recall": rec,
-        "F1-score": f1,
-        "ROC-AUC": rocauc,
-        "Balanced Acc.": bal_acc
-    }, lr
+        "Accuracy": classification["accuracy"],
+        "Balanced Acc.": classification["balanced_accuracy"],
+        "Precision": classification["precision"],
+        "Recall": classification["recall"],
+        "F1-score": classification["f1"],
+        "ROC-AUC": classification["roc_auc"],
+    }
+
+    return metrics, model
+
 
 def display_lr_metrics(metrics_tab, metrics):
+    """Render the metric summary and confusion matrix inside Streamlit."""
+
     df = pd.DataFrame([metrics])
 
     metric_cols = ["Accuracy", "Balanced Acc.", "Precision", "Recall", "F1-score", "ROC-AUC"]
@@ -304,7 +413,10 @@ def display_lr_metrics(metrics_tab, metrics):
 
     return column2
 
+
 def get_telco_lr_metrics_caption(column2):
+    """Add the descriptive caption explaining the Telco metric table."""
+
     column2.caption(body="<br><br>The logistic regression model demonstrates solid discriminatory " \
         "power (ROC-AUC = 0.84) and a balanced operating point chosen for F1. On the test set " \
         "it produced 838 true negatives, 197 false positives, 126 false negatives, and 248 true " \
@@ -316,9 +428,11 @@ def get_telco_lr_metrics_caption(column2):
         "balance between catching churners and limiting false positives. In practice, lowering the threshold " \
         "would increase recall (fewer missed churners) at the cost of precision, whereas raising it would reduce " \
         "false positives but miss more churners.", unsafe_allow_html=True)
-    
+
 
 def get_internet_lr_metrics_caption(column2):
+    """Add the descriptive caption for the Internet customer report."""
+
     column2.caption(body="After hyperparameter tuning, the Logistic Regression model (C = 0.01, class_weight = " \
     "'balanced', threshold = 0.408) achieved strong and well-balanced performance on the test set. The model " \
     "reached an accuracy of 0.865 and a balanced accuracy of 0.860, indicating that it performs consistently across " \
