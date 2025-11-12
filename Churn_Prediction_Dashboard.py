@@ -3,7 +3,7 @@ import plotly.express as px
 import streamlit as st
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, roc_auc_score, roc_curve
+from sklearn.metrics import classification_report, roc_auc_score, roc_curve, recall_score
 from sklearn.ensemble import RandomForestClassifier
 import shap
 import numpy as np
@@ -19,11 +19,100 @@ from src.telco_data_preprocessing import split_telco_data, get_scaled_telco_feat
 from src.internet_data_preprocessing import split_internet_data, get_scaled_internet_features, encode_internet_data
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
-from src.logistic_regression import get_internet_metrics_caption, get_telco_metrics_caption, display_lr_metrics, perform_primary_lg_training, cross_validate_lg_model, hyperparameter_tune_lg, retrain_lg_model
-from src.random_forest import get_internet_metrics_caption, get_telco_metrics_caption, display_rf_metrics, perform_primary_rf_training, cross_validate_rf_model, hyperparameter_tune_rf, retrain_rf_model
-from src.xgboost import get_internet_metrics_caption, get_telco_metrics_caption, display_xgb_metrics, perform_primary_xgb_training, cross_validate_xgb_model, xgb_random_search, xgb_grid_refine, retrain_xgb_model
+from src.logistic_regression import get_internet_lr_metrics_caption, get_telco_lr_metrics_caption, display_lr_metrics, perform_primary_lg_training, cross_validate_lg_model, hyperparameter_tune_lg, retrain_lg_model
+from src.random_forest import get_internet_rf_metrics_caption, get_telco_rf_metrics_caption, display_rf_metrics, perform_primary_rf_training, cross_validate_rf_model, hyperparameter_tune_rf, retrain_rf_model
+from src.xgboost import get_internet_xgb_metrics_caption, get_telco_xgb_metrics_caption, display_xgb_metrics, perform_primary_xgb_training, cross_validate_xgb_model, xgb_random_search, xgb_grid_refine, retrain_xgb_model
 from sklearn.model_selection import StratifiedKFold
-from src.shap import get_lr_explanation, get_rf_explanation, get_xgb_explanation
+from src.shap import (
+    get_lr_explanation, get_rf_explanation, get_xgb_explanation,
+    lr_local_shap_by_truth, rf_local_shap_by_truth, xgb_local_shap_by_truth,
+    collect_attributions_for_tests, faithfulness_report, stability_report, sanity_report, local_faithfulness_report, _patch_base_score_in_modelfile, 
+    make_get_attribs_xgb_booster, make_get_attribs_xgb_booster_with_schema
+)
+from src.lime import get_lime_explanations_binary, lime_local_deletion_test, lime_local_rank_vs_impact, lime_xgb_local_deletion_test, lime_xgb_local_rank_vs_impact
+from src.dice import get_counterfactual_analysis
+from src.helper import wrap_for_threshold
+from src.threshold_model import ThresholdedModel
+from src.XGBooster_adapter import XGBoosterAdapter
+from sklearn.metrics import roc_auc_score
+from src.customer import get_customers_for_explanation
+from io import StringIO
+from src.stability_tests import local_stability_report_generic
+from typing import Dict, Iterable, Tuple, Callable
+from scipy.stats import kendalltau, spearmanr
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils.validation import check_is_fitted
+import hashlib
+
+def _spearman_abs(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman ρ between |a| and |b| (robust to sign)."""
+    a_abs, b_abs = np.abs(a).ravel(), np.abs(b).ravel()
+    if np.all(a_abs == a_abs[0]) or np.all(b_abs == b_abs[0]):
+        return 0.0
+    return float(spearmanr(a_abs, b_abs).correlation)
+
+def _get_row_attr(get_attr_batch: callable, X: pd.DataFrame, row_id) -> np.ndarray:
+    """Return attribution vector for a single row_id using a batch getter."""
+    A = get_attr_batch(X.loc[[row_id]])
+    return np.asarray(A).ravel()
+
+def _feature_shuffle_once(get_attr_batch: callable, X: pd.DataFrame, row_id, feat: str, rng: np.random.RandomState) -> float:
+    """Shuffle one feature column in X (incl. the picked row), recompute attributions for that row."""
+    X_shuf = X.copy()
+    X_shuf[feat] = X_shuf[feat].sample(frac=1.0, random_state=int(rng.randint(0, 1e9))).values
+    return _get_row_attr(get_attr_batch, X_shuf, row_id)
+
+
+def _ensure_series(y, index_like):
+    """Return y as a pandas Series aligned to index_like."""
+    import pandas as pd
+    if isinstance(y, pd.Series):
+        return y.reindex(index_like)
+    if hasattr(y, "values"):  # DataFrame with a single col "Churn" etc.
+        if y.shape[1] == 1:
+            return y.iloc[:, 0].reindex(index_like)
+        if "Churn" in y.columns:
+            return y["Churn"].reindex(index_like)
+        raise ValueError("y_val DataFrame must have a single column or 'Churn'.")
+    # numpy array
+    return pd.Series(y, index=index_like)
+
+def make_stratified_batch(X, y, include_index=None, n_per_class=80, seed=42):
+    """
+    Return (X_batch, y_batch) with both classes present.
+    Ensures include_index is in the batch. Works even if classes imbalanced.
+    """
+    import numpy as np, pandas as pd
+    rng = np.random.RandomState(seed)
+    y = _ensure_series(y, X.index)
+
+    # Map Yes/No -> 1/0 if needed
+    if y.dtype == object:
+        y_num = y.map({"Yes": 1, "No": 0})
+    else:
+        y_num = y.astype(int)
+
+    classes = np.unique(y_num.dropna().values)
+    if len(classes) < 2:
+        # fallback: use the full test set; the caller can decide to skip label-rand
+        return X, y
+
+    idx = []
+    for c in classes:
+        cls_idx = y_num[y_num == c].index
+        take = min(n_per_class, len(cls_idx))
+        if take == 0:
+            continue
+        picked = rng.choice(cls_idx, size=take, replace=False)
+        idx.extend(picked)
+
+    if include_index is not None:
+        # make sure the chosen instance is present
+        if include_index not in idx:
+            idx.append(include_index)
+
+    idx = pd.Index(idx).unique()
+    return X.loc[idx], y.loc[idx]
 
 
 st.set_page_config(page_title='Churn Prediction Dashboard', layout="wide")
@@ -140,7 +229,7 @@ if selected_dataset in datasets:
             telco_data_encoded = encode_telco_data(telco_data, telco_data_engineered)
             get_correlation_heatmap_with_engineered_features(telco_data_encoded)
 
-        scaled_X_train_features, scaled_X_test_features = get_scaled_telco_features(X_train_encoded, X_test_encoded)
+        scaler, scaled_X_train_features, scaled_X_test_features, num_cols_in_scaler_order = get_scaled_telco_features(X_train_encoded, X_test_encoded)
         background_data_scaled = (
             scaled_X_train_features
                 .assign(Churn=y_train.values)
@@ -158,21 +247,382 @@ if selected_dataset in datasets:
         #------------------- Train models -----------------------------
 
         cross_validation = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        immutable = {"Is_female","SeniorCitizen","Partner","Dependents","tenure","TotalCharges","IsLongTermContract",
+             "AvgMonthlyCharge","AvgPricePerService","OnlineServiceCount"}
+        onehot_groups = {
+            "Contract": ["Contract_One year","Contract_Two year"],
+            "PaymentMethod": ["PaymentMethod_Credit card (automatic)","PaymentMethod_Electronic check","PaymentMethod_Mailed check"],
+            "InternetService": ["InternetService_DSL","InternetService_Fiber optic","InternetService_No"],
+        }
         if selected_prediction_model == 'Logistic Regression':
             
             # perform_primary_lg_training(scaled_X_train_features, y_train, scaled_X_test_features, y_test, "balanced")
             # cross_validate_lg_model(X_train_encoded, y_train, cross_validation, "balanced")
             # hyperparameter_tune_lg(X_train_encoded, y_train, cross_validation)
             metrics, tuned_model = retrain_lg_model(scaled_X_train_features, y_train, scaled_X_test_features, y_test, 0.5832, 0.00316)
+
+            # def group_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.5832, reference=None):
+            #     """Return a per-group fairness table and the chosen reference group."""
+            #     # pick reference = largest group if not provided
+            #     ref = reference or df[group_col].value_counts().idxmax()
+
+            #     def recall_pos(g):
+            #         mask = g[y_true] == 1
+            #         if mask.sum() == 0:
+            #             return np.nan
+            #         y_hat = (g[y_proba] >= threshold).astype(int)
+            #         return recall_score(g.loc[mask, y_true], y_hat[mask])
+
+            #     agg = (
+            #         df.groupby(group_col)
+            #           .apply(lambda g: pd.Series({
+            #               'n': len(g),
+            #               'observed_churn_rate': g[y_true].mean(),
+            #               'mean_pred_proba': g[y_proba].mean(),
+            #               f'prediction_rate@{threshold:.3f}': (g[y_proba] >= threshold).mean(),
+            #               'recall_pos': recall_pos(g),
+            #           }))
+            #           .reset_index()
+            #     )
+
+            #     ref_mean = agg.loc[agg[group_col] == ref, 'mean_pred_proba'].values[0]
+            #     agg[f'Δ_vs_{ref}'] = (agg['mean_pred_proba'] - ref_mean).abs()
+            #     agg['stat_parity_ok(≤0.05)'] = agg[f'Δ_vs_{ref}'] <= 0.05
+            #     return agg.sort_values('n', ascending=False), ref
+
+            # group_cols = ["gender", "SeniorCitizen", "Partner", "Dependents", "Contract", "PaymentMethod", "InternetService", "PaperlessBilling"]  
+            # threshold = 0.5832
+            # X_test_original_groups = X_test[group_cols].copy()
+            # if hasattr(y_test, "dtype") and y_test.dtype == object:
+            #     y_true = y_test.map({"No": 0, "Yes": 1}).astype(int)
+            # elif isinstance(y_test, pd.DataFrame) and "Churn" in y_test.columns:
+            #     y_true = y_test["Churn"].map({"No": 0, "Yes": 1}).astype(int)
+            # else:
+            #     y_true = y_test.astype(int)  # already 0/1
+
+            # if hasattr(tuned_model, "predict_proba"):           # single estimator
+            #     models = {"logreg_final": tuned_model}
+            # elif isinstance(tuned_model, (list, tuple)):        # list/tuple of estimators
+            #     models = {f"model_{i}": m for i, m in enumerate(tuned_model)}
+            # elif isinstance(tuned_model, dict):                  # already a dict
+            #     models = tuned_model
+            # else:
+            #     raise TypeError("tuned_model must be an estimator, list/tuple of estimators, or dict.")
+
+            # X_for_pred = scaled_X_test_features
+
+            # results = {}
+            # for name, model in models.items():
+            #     # get probabilities for the positive class
+            #     y_proba = model.predict_proba(X_for_pred)[:, 1]
+
+            #     # build evaluation frame aligned by index
+            #     df_eval = X_test_original_groups.copy()
+            #     df_eval["y_true"] = pd.Series(y_true.values, index=df_eval.index)
+            #     df_eval["y_proba"] = pd.Series(y_proba, index=df_eval.index)
+
+            # # per-group tables for this model
+            #     model_tables = {}
+            #     for gcol in group_cols:
+            #         sub = df_eval[[gcol, "y_true", "y_proba"]].dropna()
+            #         table, ref = group_fairness_table(
+            #             sub, group_col=gcol, y_true="y_true", y_proba="y_proba", threshold=threshold
+            #         )
+            #         model_tables[gcol] = (table, ref)
+            #     results[name] = model_tables
+
+            # st.title("Fairness Evaluation — Group-Based Metrics")
+            # st.write("Global threshold for recall comparisons (equal opportunity): ", threshold)
+
+            # for model_name, tables in results.items():
+            #     with st.expander(f"Model: {model_name}", expanded=False):
+            #         for gcol, (table, ref) in tables.items():
+            #             st.subheader(f"Group column: {gcol} (ref: {ref})")
+            #             st.dataframe(table, use_container_width=True)
+
+            #             # CSV download
+            #             csv_buf = StringIO()
+            #             table.to_csv(csv_buf, index=False)
+            #             st.download_button(
+            #                 label=f"Download CSV — {model_name} · {gcol}",
+            #                 data=csv_buf.getvalue(),
+            #                 file_name=f"fairness_{model_name}_{gcol}.csv",
+            #                 mime="text/csv"
+            #             )
+
             st.subheader("Logistic Regression Performance Analysis")
             metrics_tab, explainability_tab = st.tabs(["Metrics", "Explanation"])
             column2 = display_lr_metrics(metrics_tab, metrics)
-            get_telco_metrics_caption(column2)
+            get_telco_lr_metrics_caption(column2)
             
             # Explainability models
-            shap_tab, lime_tabe = explainability_tab.tabs(["SHAP", "LIME"])
+            attribs = collect_attributions_for_tests(
+                lr_model=tuned_model,
+                X_train_scaled_bg=scaled_X_train_features.sample(200, random_state=0),
+                X_val_scaled=scaled_X_test_features,
+
+                rf_model=None,
+                xgb_clf=None,
+                X_train_enc=None,
+                X_val_enc=None,
+
+                xgb_booster=None,
+                use_streamlit=True
+            )
+            A_lr = attribs["lr"]
+
+            # val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
+            shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
+
+            # Faithfulness
+            
+            # rep = faithfulness_report(
+            #     model=tuned_model,
+            #     X_val=scaled_X_test_features,
+            #     y_val=y_test,
+            #     A=A_lr,
+            #     feature_names=scaled_X_test_features.columns.tolist(),
+            #     n_steps=10,
+            #     seed=42,
+            #     use_proba=True
+            # )
+            # val_tab.markdown("### Faithfulness")
+            # val_tab.write(f"Spearman ρ (rank vs. single-feature impact): **{rep['rho']:.3f}**")
+            # val_tab.dataframe(rep["curve"])
+
+            # x_row = scaled_X_test_features.iloc[0]
+            # a_row = pd.Series(A_lr[0], index=scaled_X_test_features.columns)
+
+            # rep = local_faithfulness_report(
+            #     model=tuned_model,               # RF / LR / XGB model object
+            #     x_row=x_row,
+            #     a_row=a_row,
+            #     background=background_data_scaled,
+            #     n_draws=64,
+            #     n_steps=10,
+            #     replace_with="mean"              # or "draw"
+            # )
+            # val_tab.markdown("### Local Faithfulness (this customer)")
+            # val_tab.write(f"Spearman ρ (local): **{rep['rho_local']:.3f}**")
+            # val_tab.line_chart(pd.DataFrame({"p(k)": rep["deletion_curve"]["preds"]}, index=rep["deletion_curve"]["k"]))
+            # val_tab.caption(
+            #     f"Deletion curve AUC: {rep['deletion_curve']['auc']:.4f} (lower is better). "
+            #     f"Baseline p0={rep['deletion_curve']['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(rep['flip_k']) if rep['flip_k'] is not None else ''}"
+            # )
+            # val_tab.dataframe(rep["single_feature_impacts"].head(12).to_frame("local_impact"))
+
+            # X_train_for_lime = scaled_X_train_features  # use X_train_encoded for RF/XGB branches
+            # X_test_for_lime = scaled_X_test_features
+            # random_state = 42
+            # # choose a row to test (must be same feature space as the explainer/model)
+            # row_id = X_test_for_lime.index[0]           # e.g., scaled_X_test_features or X_test_encoded
+            # x_row = X_test_for_lime.loc[row_id]
+
+            # lime_explainer = LimeTabularExplainer(
+            #     training_data=X_train_for_lime.to_numpy(),
+            #     feature_names=X_train_for_lime.columns.tolist(),
+            #     class_names=[str(c) for c in getattr(tuned_model, "classes_", [0, 1])],  # <-- FIXED
+            #     mode="classification",
+            #     discretize_continuous=True,
+            #     sample_around_instance=True,
+            #     random_state=random_state,
+            # )
+
+            # lt = lime_local_deletion_test(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     k_max=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Deletion curve AUC: **{lt['auc']:.4f}** (lower is better). "
+            #     f"Baseline p0={lt['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(lt['flip_k']) if lt['flip_k'] is not None else 'No flip'}."
+            # )
+
+            # corr = lime_local_rank_vs_impact(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Spearman ρ (LIME rank vs single-feature impact): **{corr['rho']:.3f}** "
+            #     f"(p={corr['pval']:.3g})."
+            # )
+
+
+            # Stability
+            # get_attr_lr = lambda X: collect_attributions_for_tests(
+            #     lr_model=tuned_model,
+            #     X_train_scaled_bg=scaled_X_train_features.sample(200, random_state=0),
+            #     X_val_scaled=X,
+            #     use_streamlit=False
+            # )["lr"]
+            # stab = stability_report(get_attr_lr, scaled_X_test_features, n_boot=20, sample_frac=0.8, seed=42)
+            # val_tab.markdown("### Stability")
+            # val_tab.write(f"Kendall’s τ (mean ± sd): **{stab['kendall_tau_mean']:.3f} ± {stab['kendall_tau_std']:.3f}**")
+
+            # ---------- LR: cache full-test attributions once (fast reuse) ----------
+            # --- 1) Build a hashable fingerprint for LR ---
+            # --- Hashable fingerprint for LR (for cache invalidation) ---
+            # def _lr_model_key(m: LogisticRegression) -> str:
+            #     coef = getattr(m, "coef_", None)
+            #     intercept = getattr(m, "intercept_", None)
+            #     n_iter = getattr(m, "n_iter_", None)
+            #     parts = []
+            #     if coef is not None:      parts.append(coef.ravel().tobytes())
+            #     if intercept is not None: parts.append(np.atleast_1d(intercept).ravel().tobytes())
+            #     if n_iter is not None:    parts.append(np.atleast_1d(n_iter).ravel().tobytes())
+            #     parts.append(str(getattr(m, "C", None)).encode())
+            #     parts.append(str(getattr(m, "penalty", None)).encode())
+            #     parts.append(str(getattr(m, "solver", None)).encode())
+            #     return str(abs(hash(b"||".join(parts))))
+
+            # @st.cache_data(show_spinner=False)
+            # def _lr_full_attr(
+            #     _model: LogisticRegression,  # ignored by Streamlit hasher (leading underscore)
+            #     model_key: str,
+            #     X_train_bg: pd.DataFrame,
+            #     X_val_scaled: pd.DataFrame,
+            # ) -> pd.DataFrame:
+            #     A = collect_attributions_for_tests(
+            #         lr_model=_model,
+            #         X_train_scaled_bg=X_train_bg,
+            #         X_val_scaled=X_val_scaled,
+            #         rf_model=None, xgb_clf=None,
+            #         X_train_enc=None, X_val_enc=None,
+            #         xgb_booster=None,
+            #         use_streamlit=False
+            #     )["lr"]
+            #     return pd.DataFrame(A, index=X_val_scaled.index, columns=X_val_scaled.columns)
+
+            # # --- use it (always pass model_key!) ---
+            # lr_key   = _lr_model_key(tuned_model)
+            # bg_sample = scaled_X_train_features.sample(min(200, len(scaled_X_train_features)), random_state=0)
+
+            # A_lr_full = _lr_full_attr(
+            #     _model=tuned_model,
+            #     model_key=lr_key,
+            #     X_train_bg=bg_sample,
+            #     X_val_scaled=scaled_X_test_features,
+            # )
+
+            # def get_attr_lr_cached(X_batch: pd.DataFrame) -> np.ndarray:
+            #     # try reuse from full cache
+            #     try:
+            #         return A_lr_full.loc[X_batch.index].to_numpy()
+            #     except KeyError:
+            #         # small recompute for perturbed rows not in A_lr_full
+            #         A_tmp = collect_attributions_for_tests(
+            #             lr_model=tuned_model,
+            #             X_train_scaled_bg=bg_sample,
+            #             X_val_scaled=X_batch,
+            #             use_streamlit=False
+            #         )["lr"]
+            #         return A_tmp
+
+            # with val_tab:
+            #     st.markdown("### Local Stability (Logistic Regression)")
+            #     lr_row_id = st.selectbox("Pick a row (LR):", scaled_X_test_features.index.tolist(), index=0, key="lr_row_pick")
+            #     n_pert = st.slider("Perturbations", 10, 100, 30, key="lr_npert")
+            #     noise = st.number_input("Numeric noise (σ)", min_value=0.0, max_value=1.0, value=0.02, step=0.01, key="lr_noise")
+            #     flip = st.number_input("Flip prob (binary/one-hot)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, key="lr_flip")
+
+            #     if st.button("Run local stability (LR)"):
+            #         # In the scaled matrix, nearly everything is numeric; treat one-hots as binary [0/1].
+            #         numeric_cols = scaled_X_test_features.columns.tolist()
+            #         # If you can enumerate true one-hots, pass them here; otherwise an empty dict is safe.
+            #         report = local_stability_report_generic(
+            #             get_attr_for_batch=get_attr_lr_cached,
+            #             X_matrix=scaled_X_test_features,
+            #             row_id=lr_row_id,
+            #             numeric_cols=numeric_cols,
+            #             binary_cols=[],                    # (optional) add pure binary cols here if you keep them separate
+            #             onehot_groups=onehot_groups,       # if columns exist in scaled matrix with same names
+            #             n_perturb=n_pert,
+            #             noise_scale=noise,
+            #             flip_prob=flip,
+            #             k_list=(5,10)
+            #         )
+            #         st.write(f"Kendall’s τ (mean): **{report['kendall_tau_mean']:.3f}**")
+            #         st.write(f"Spearman ρ (mean): **{report['spearman_rho_mean']:.3f}**")
+            #         st.write(f"Avg std(|attrib|): **{report['mean_attr_std']:.4f}**")
+            #         st.write({f"Top-{k} overlap": f"{report['topk_overlap_mean'][k]:.2f}" for k in (5,10)})
+            #         st.dataframe(report["attr_std_by_feature"].head(12).to_frame("std").style.format({"std": "{:.4f}"}))
+
+
+            # Sanity (label randomization)
+        #     san = sanity_report(
+        #     model=tuned_model,
+        #     X_val=scaled_X_test_features,
+        #     y_val=y_test,
+        #     get_attribs_callable=get_attr_lr_cached,  # <-- new name
+        #     randomize="labels",
+        #     seed=42
+        # )
+        #     val_tab.markdown("### Sanity")
+        #     val_tab.write(f"Spearman ρ vs original after label randomization: **{san['spearman_rho_vs_original']:.3f}** "
+        #                   "(should drop toward 0 if explanations depend on learned signal)")
+
+            
+
             get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
-    
+            lr_local_shap_by_truth(
+                lr_model=tuned_model,
+                background_data=background_data_scaled,
+                X_test_scaled=scaled_X_test_features,
+                X_test=X_test,
+                y_test=y_test,             # must be aligned with X_test_scaled index
+                shap_tab=shap_tab,
+                threshold=0.5832,            # your operating threshold
+                top_display=12
+                )   
+            get_lime_explanations_binary(tuned_model, X_test, scaled_X_train_features, scaled_X_test_features, y_test, 0.5832, lime_tab, title_prefix="Local LIME – Logistic Regression")        
+
+            lr_for_dice = ThresholdedModel(tuned_model, threshold=0.5832)
+
+            continuous_features = [
+                "tenure",
+                "MonthlyCharges",
+                "TotalCharges",          
+                "AvgMonthlyCharge",
+                "OnlineServiceCount",
+                "AvgPricePerService",
+            ]
+
+            features_to_vary = [
+                "PhoneService","MultipleLines","OnlineSecurity","OnlineBackup",
+                "DeviceProtection","TechSupport","StreamingTV","StreamingMovies",
+                "PaperlessBilling","MonthlyCharges",
+                "Contract_One year","Contract_Two year",
+                "PaymentMethod_Credit card (automatic)","PaymentMethod_Electronic check","PaymentMethod_Mailed check",
+                "InternetService_Fiber optic","InternetService_No",
+            ]
+
+            results = get_counterfactual_analysis(
+                y_test=y_test,
+                X_test=scaled_X_test_features,
+                X_train=scaled_X_train_features,
+                y_train=y_train,
+                model=lr_for_dice,                         # must expose predict_proba
+                continuous_features=continuous_features,
+                counterfactual_tab=counterfactual_tab,
+                outcome_name="Churn",
+                total_CFs=6,
+                features_to_vary=features_to_vary,                    # or "all"
+                permitted_range={"MonthlyCharges":[15,150]},
+                scaler=scaler,
+                numeric_feature_names_in_scaler_order=num_cols_in_scaler_order,
+                immutable_features=immutable,
+                onehot_groups=onehot_groups,
+            )
 
         elif selected_prediction_model == 'Random Forest':
             
@@ -180,14 +630,477 @@ if selected_dataset in datasets:
             # cross_validate_rf_model(X_train_encoded, y_train, cross_validation, "balanced")
             # hyperparameter_tune_rf(X_train_encoded, y_train, cross_validation)
             metrics, tuned_model = retrain_rf_model(X_train_encoded, y_train, X_test_encoded, y_test, 0.5418, 477, 17, 12, 0.3, None)
+
+            # def group_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.5418, reference=None):
+            #     """Return a per-group fairness table and the chosen reference group."""
+            #     # pick reference = largest group if not provided
+            #     ref = reference or df[group_col].value_counts().idxmax()
+
+            #     def recall_pos(g):
+            #         mask = g[y_true] == 1
+            #         if mask.sum() == 0:
+            #             return np.nan
+            #         y_hat = (g[y_proba] >= threshold).astype(int)
+            #         return recall_score(g.loc[mask, y_true], y_hat[mask])
+
+            #     agg = (
+            #         df.groupby(group_col)
+            #           .apply(lambda g: pd.Series({
+            #               'n': len(g),
+            #               'observed_churn_rate': g[y_true].mean(),
+            #               'mean_pred_proba': g[y_proba].mean(),
+            #               f'prediction_rate@{threshold:.3f}': (g[y_proba] >= threshold).mean(),
+            #               'recall_pos': recall_pos(g),
+            #           }))
+            #           .reset_index()
+            #     )
+
+            #     ref_mean = agg.loc[agg[group_col] == ref, 'mean_pred_proba'].values[0]
+            #     agg[f'Δ_vs_{ref}'] = (agg['mean_pred_proba'] - ref_mean).abs()
+            #     agg['stat_parity_ok(≤0.05)'] = agg[f'Δ_vs_{ref}'] <= 0.05
+            #     return agg.sort_values('n', ascending=False), ref
+
+            # group_cols = ["gender", "SeniorCitizen", "Partner", "Dependents", "Contract", "PaymentMethod", "InternetService", "PaperlessBilling"]  
+            # threshold = 0.5418
+            # X_test_original_groups = X_test[group_cols].copy()
+            # if hasattr(y_test, "dtype") and y_test.dtype == object:
+            #     y_true = y_test.map({"No": 0, "Yes": 1}).astype(int)
+            # elif isinstance(y_test, pd.DataFrame) and "Churn" in y_test.columns:
+            #     y_true = y_test["Churn"].map({"No": 0, "Yes": 1}).astype(int)
+            # else:
+            #     y_true = y_test.astype(int)  # already 0/1
+
+            # if hasattr(tuned_model, "predict_proba"):           # single estimator
+            #     models = {"logreg_final": tuned_model}
+            # elif isinstance(tuned_model, (list, tuple)):        # list/tuple of estimators
+            #     models = {f"model_{i}": m for i, m in enumerate(tuned_model)}
+            # elif isinstance(tuned_model, dict):                  # already a dict
+            #     models = tuned_model
+            # else:
+            #     raise TypeError("tuned_model must be an estimator, list/tuple of estimators, or dict.")
+
+            # X_for_pred = X_test_encoded
+
+            # results = {}
+            # for name, model in models.items():
+            #     # get probabilities for the positive class
+            #     y_proba = model.predict_proba(X_for_pred)[:, 1]
+
+            #     # build evaluation frame aligned by index
+            #     df_eval = X_test_original_groups.copy()
+            #     df_eval["y_true"] = pd.Series(y_true.values, index=df_eval.index)
+            #     df_eval["y_proba"] = pd.Series(y_proba, index=df_eval.index)
+
+            # # per-group tables for this model
+            #     model_tables = {}
+            #     for gcol in group_cols:
+            #         sub = df_eval[[gcol, "y_true", "y_proba"]].dropna()
+            #         table, ref = group_fairness_table(
+            #             sub, group_col=gcol, y_true="y_true", y_proba="y_proba", threshold=threshold
+            #         )
+            #         model_tables[gcol] = (table, ref)
+            #     results[name] = model_tables
+
+            # st.title("Fairness Evaluation — Group-Based Metrics")
+            # st.write("Global threshold for recall comparisons (equal opportunity): ", threshold)
+            # for model_name, tables in results.items():
+            #     with st.expander(f"Model: {model_name}", expanded=False):
+            #         for gcol, (table, ref) in tables.items():
+            #             st.subheader(f"Group column: {gcol} (ref: {ref})")
+            #             st.dataframe(table, use_container_width=True)
+
+            #             # CSV download
+            #             csv_buf = StringIO()
+            #             table.to_csv(csv_buf, index=False)
+            #             st.download_button(
+            #                 label=f"Download CSV — {model_name} · {gcol}",
+            #                 data=csv_buf.getvalue(),
+            #                 file_name=f"fairness_{model_name}_{gcol}.csv",
+            #                 mime="text/csv"
+            #             )
+
             st.subheader("Random Forest Performance Analysis")
             metrics_tab, explainability_tab = st.tabs(["Metrics", "Explanation"])
             column2 = display_rf_metrics(metrics_tab, metrics)
-            get_telco_metrics_caption(column2)
+            get_telco_rf_metrics_caption(column2)
 
             # Explainability models
-            shap_tab, lime_tabe = explainability_tab.tabs(["SHAP", "LIME"])
-            get_rf_explanation(tuned_model, background_data_encoded, X_test_encoded, shap_tab)
+            # ---- SHAP attribution matrices for tests (Telco RF) ----
+            attribs = collect_attributions_for_tests(
+                lr_model=None,
+                X_train_scaled_bg=None,
+                X_val_scaled=None,
+
+                rf_model=tuned_model,
+                xgb_clf=None,
+                X_train_enc=X_train_encoded,
+                X_val_enc=X_test_encoded,
+
+                xgb_booster=None,
+                use_streamlit=True
+            )
+            A_rf = attribs["rf"]        # (n_test, n_features_encoded)
+
+            # val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
+            shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
+
+
+            # Faithfulness
+            
+            # rep = faithfulness_report(
+            #     model=tuned_model,
+            #     X_val=X_test_encoded,
+            #     y_val=y_test,
+            #     A=A_rf,
+            #     feature_names=X_test_encoded.columns.tolist(),
+            #     n_steps=10,
+            #     seed=42,
+            #     use_proba=True
+            # )
+            # val_tab.markdown("### Faithfulness")
+            # val_tab.write(f"Spearman ρ (rank vs. single-feature impact): **{rep['rho']:.3f}**")
+            # val_tab.dataframe(rep["curve"])
+
+            # x_row = X_test_encoded.iloc[0]
+            # a_row = pd.Series(A_rf[0], index=X_test_encoded.columns)
+
+            # rep = local_faithfulness_report(
+            #     model=tuned_model,               # RF / LR / XGB model object
+            #     x_row=x_row,
+            #     a_row=a_row,
+            #     background=background_data_encoded,
+            #     n_draws=64,
+            #     n_steps=10,
+            #     replace_with="mean"              # or "draw"
+            # )
+            # val_tab.markdown("### Local Faithfulness (this customer)")
+            # val_tab.write(f"Spearman ρ (local): **{rep['rho_local']:.3f}**")
+            # val_tab.line_chart(pd.DataFrame({"p(k)": rep["deletion_curve"]["preds"]}, index=rep["deletion_curve"]["k"]))
+            # val_tab.caption(
+            #     f"Deletion curve AUC: {rep['deletion_curve']['auc']:.4f} (lower is better). "
+            #     f"Baseline p0={rep['deletion_curve']['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(rep['flip_k']) if rep['flip_k'] is not None else ''}"
+            # )
+            # val_tab.dataframe(rep["single_feature_impacts"].head(12).to_frame("local_impact"))
+
+            # X_train_for_lime = X_train_encoded  # use X_train_encoded for RF/XGB branches
+            # X_test_for_lime = X_test_encoded
+            # random_state = 42
+            # choose a row to test (must be same feature space as the explainer/model)
+            # row_id = X_test_for_lime.index[0]           # e.g., scaled_X_test_features or X_test_encoded
+            # x_row = X_test_for_lime.loc[row_id]
+
+            # lime_explainer = LimeTabularExplainer(
+            #     training_data=X_train_for_lime.to_numpy(),
+            #     feature_names=X_train_for_lime.columns.tolist(),
+            #     class_names=[str(c) for c in getattr(tuned_model, "classes_", [0, 1])],  # <-- FIXED
+            #     mode="classification",
+            #     discretize_continuous=True,
+            #     sample_around_instance=True,
+            #     random_state=random_state,
+            # )
+
+            # lt = lime_local_deletion_test(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     k_max=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Deletion curve AUC: **{lt['auc']:.4f}** (lower is better). "
+            #     f"Baseline p0={lt['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(lt['flip_k']) if lt['flip_k'] is not None else 'No flip'}."
+            # )
+
+            # corr = lime_local_rank_vs_impact(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Spearman ρ (LIME rank vs single-feature impact): **{corr['rho']:.3f}** "
+            #     f"(p={corr['pval']:.3g})."
+            # )
+
+            # # Stability
+            # # Ensure indices are simple and unique
+            # X_test_encoded_copy = X_test_encoded.copy()
+            # X_test_encoded_copy.index = pd.RangeIndex(len(X_test_encoded))
+
+            # # # 1) Precompute RF attributions once on the FULL test set
+            # A_rf_full = pd.DataFrame(
+            #     A_rf,  # from collect_attributions_for_tests on FULL X_test_encoded
+            #     index=X_test_encoded_copy.index,
+            #     columns=X_test_encoded_copy.columns
+            # )
+
+            # # Build a position map for robust slicing even if a resample resets index
+            # pos_map = pd.Series(np.arange(len(X_test_encoded_copy)), index=X_test_encoded_copy.index)
+
+            # def get_attr_rf_cached(X_subset: pd.DataFrame):
+            #     # Primary: index-aligned slice (fast path)
+            #     try:
+            #         return A_rf_full.loc[X_subset.index].to_numpy()
+            #     except KeyError:
+            #         # Fallback: map indices to positions (handles reset_index in resample)
+            #         idx = pos_map.reindex(X_subset.index)
+            #         if idx.isna().any():
+            #             # As a last resort, assume positional slice (only works if X_subset
+            #             # is taken by .iloc from the same matrix)
+            #             return A_rf_full.to_numpy()[np.arange(len(X_subset)), :]
+            #         return A_rf_full.to_numpy()[idx.to_numpy().astype(int), :]
+
+            # Now run stability (cheap, no SHAP recompute)
+            # stab = stability_report(get_attr_rf_cached, X_test_encoded_copy, n_boot=20, sample_frac=0.8, seed=42)
+            # val_tab.markdown("### Stability")
+            # val_tab.write(f"Kendall’s τ (mean ± sd): **{stab['kendall_tau_mean']:.3f} ± {stab['kendall_tau_std']:.3f}**")
+
+            # --- 1) Build a hashable fingerprint for LR ---
+            # --- Hashable fingerprint for LR (for cache invalidation) ---
+            # def _rf_model_key(m: RandomForestClassifier) -> str:
+            #     """
+            #     Build a hashable fingerprint for a fitted RF.
+            #     Includes: key hyperparams, n_estimators, feature_importances_,
+            #     oob_score_ (if present). This is sufficient to invalidate cache
+            #     when the trained forest changes.
+            #     """
+            #     parts = []
+            #     # core hyperparams that change the fit
+            #     hp = m.get_params(deep=False)
+            #     key_params = (
+            #         hp.get("n_estimators"), hp.get("criterion"),
+            #         hp.get("max_depth"), hp.get("max_features"),
+            #         hp.get("min_samples_split"), hp.get("min_samples_leaf"),
+            #         hp.get("min_weight_fraction_leaf"), hp.get("max_leaf_nodes"),
+            #         hp.get("bootstrap"), hp.get("class_weight"),
+            #         hp.get("ccp_alpha"), hp.get("random_state")
+            #     )
+            #     parts.append(str(key_params).encode())
+
+            #     # learned quantities
+            #     if hasattr(m, "n_estimators"):
+            #         parts.append(str(m.n_estimators).encode())
+            #     if hasattr(m, "feature_importances_"):
+            #         parts.append(np.asarray(m.feature_importances_, dtype=np.float64).tobytes())
+            #     if hasattr(m, "oob_score_"):
+            #         parts.append(str(m.oob_score_).encode())
+
+            #     return str(abs(hash(b"||".join(parts))))
+
+            # # -------- Cache full-test RF attributions (ignore unhashable model) --------
+            # @st.cache_data(show_spinner=False)
+            # def _rf_full_attr(
+            #     _model: RandomForestClassifier,  # leading underscore => Streamlit won't hash it
+            #     model_key: str,                  # <- hashable fingerprint to invalidate when RF changes
+            #     X_train_enc: pd.DataFrame,       # needed by your collector
+            #     X_val_enc: pd.DataFrame
+            # ) -> pd.DataFrame:
+            #     A = collect_attributions_for_tests(
+            #         lr_model=None,
+            #         X_train_scaled_bg=None, X_val_scaled=None,
+            #         rf_model=_model,
+            #         xgb_clf=None,
+            #         X_train_enc=X_train_enc,
+            #         X_val_enc=X_val_enc,
+            #         xgb_booster=None,
+            #         use_streamlit=False
+            #     )["rf"]  # -> (n_val, n_features)
+            #     return pd.DataFrame(A, index=X_val_enc.index, columns=X_val_enc.columns)
+
+            # # -------- Build cache + getter in your RF branch --------
+            # rf_key = _rf_model_key(tuned_model)
+            # A_rf_full_df = _rf_full_attr(
+            #     _model=tuned_model,
+            #     model_key=rf_key,
+            #     X_train_enc=X_train_encoded,
+            #     X_val_enc=X_test_encoded,
+            # )
+
+            # def get_attr_rf_cached(X_batch: pd.DataFrame) -> np.ndarray:
+            #     # fast path: reuse precomputed rows
+            #     try:
+            #         return A_rf_full_df.loc[X_batch.index].to_numpy()
+            #     except KeyError:
+            #         # small-batch recompute for perturbed rows not in the cache
+            #         A_tmp = collect_attributions_for_tests(
+            #             rf_model=tuned_model,
+            #             X_train_enc=X_train_encoded,
+            #             X_val_enc=X_batch,
+            #             use_streamlit=False
+            #         )["rf"]
+            #         return A_tmp
+
+            # -------- Local stability UI (RF) --------
+            # with val_tab:
+            #     st.markdown("### Local Stability (Random Forest)")
+            #     rf_row_id = st.selectbox("Pick a row (RF):", X_test_encoded.index.tolist(), index=0, key="rf_row_pick")
+            #     n_pert = st.slider("Perturbations", 10, 100, 30, key="rf_npert")
+            #     noise = st.number_input("Numeric noise (σ)", 0.0, 1.0, 0.02, 0.01, key="rf_noise")
+            #     flip = st.number_input("Flip prob (binary/one-hot)", 0.0, 1.0, 0.05, 0.01, key="rf_flip")
+
+            #     # heuristics: treat uint8 one-hots as binary; the rest as numeric
+            #     binary_cols_rf  = [c for c in X_test_encoded.columns
+            #                        if set(pd.unique(X_test_encoded[c])).issubset({0, 1})]
+            #     numeric_cols_rf = [c for c in X_test_encoded.columns if c not in binary_cols_rf]
+
+            #     if st.button("Run local stability (RF)"):
+            #         report = local_stability_report_generic(
+            #             get_attr_for_batch=get_attr_rf_cached,
+            #             X_matrix=X_test_encoded,
+            #             row_id=rf_row_id,
+            #             numeric_cols=numeric_cols_rf,
+            #             binary_cols=binary_cols_rf,
+            #             onehot_groups=onehot_groups,  # your existing dict
+            #             n_perturb=n_pert,
+            #             noise_scale=noise,
+            #             flip_prob=flip,
+            #             k_list=(5, 10)
+            #         )
+            #         st.write(f"Kendall’s τ (mean): **{report['kendall_tau_mean']:.3f}**")
+            #         st.write(f"Spearman ρ (mean): **{report['spearman_rho_mean']:.3f}**")
+            #         st.write(f"Avg std(|attrib|): **{report['mean_attr_std']:.4f}**")
+            #         st.write({f"Top-{k} overlap": f"{report['topk_overlap_mean'][k]:.2f}" for k in (5, 10)})
+            #         st.dataframe(report["attr_std_by_feature"].head(12).to_frame("std").style.format({"std": "{:.4f}"}))
+
+
+
+            # Sanity (label randomization)
+            # def _to_hashable_tuple(idx: pd.Index) -> tuple:
+            #     vals = idx.tolist()
+            #     try:
+            #         tuple(vals)
+            #         return tuple(vals)
+            #     except TypeError:
+            #         return tuple(map(str, vals))
+            
+            # @st.cache_data(show_spinner=False)
+            # def _rf_attr_cache(A_rf_array: np.ndarray,
+            #                    index_values: tuple,
+            #                    column_values: tuple) -> tuple[pd.DataFrame, pd.Series]:
+            #     """
+            #     Materialize RF attributions into a DataFrame with original index/columns,
+            #     and build a position map for robust slicing.
+            #     """
+            #     x_index = pd.Index(list(index_values))
+            #     x_columns = pd.Index(list(column_values))
+            #     A_rf_full_df = pd.DataFrame(A_rf_array, index=x_index, columns=x_columns).astype("float64")
+            
+            #     if A_rf_full_df.shape[0] != len(x_index):
+            #         raise ValueError("A_rf_full rows != X_test_encoded rows.")
+            #     if not A_rf_full_df.columns.equals(x_columns):
+            #         raise ValueError("A_rf_full columns differ from X_test_encoded columns.")
+            #     if not x_index.is_unique:
+            #         st.warning("X_test_encoded has non-unique index; positional fallback may be used.")
+            
+            #     pos_map = pd.Series(np.arange(len(x_index)), index=x_index)
+            #     return A_rf_full_df, pos_map
+            
+            # def make_get_attr_rf_cached(A_rf_full_df: pd.DataFrame, pos_map: pd.Series):
+            #     def _getter(X_subset: pd.DataFrame) -> np.ndarray:
+            #         if len(X_subset.index) and X_subset.index.equals(A_rf_full_df.index):
+            #             return A_rf_full_df.to_numpy()
+            
+            #         if X_subset.index.isin(A_rf_full_df.index).all():
+            #             return A_rf_full_df.reindex(X_subset.index).to_numpy()
+            
+            #         idx = pos_map.reindex(X_subset.index)
+            #         if not idx.isna().any():
+            #             return A_rf_full_df.to_numpy()[idx.to_numpy().astype(int), :]
+            
+            #         st.warning("Attribution slice fell back to pure positional matching; verify index handling.", icon="⚠️")
+            #         n = len(X_subset)
+            #         if n > len(A_rf_full_df):
+            #             raise ValueError("Subset longer than reference — cannot slice positionally.")
+            #         return A_rf_full_df.to_numpy()[:n, :]
+            #     return _getter
+            
+            # # ---- RF sanity: build in strict order, keep everything inside the RF branch ----
+            # # 1) Full-test RF attributions as array
+            # attribs = collect_attributions_for_tests(
+            #     rf_model=tuned_model,
+            #     X_train_enc=X_train_encoded,
+            #     X_val_enc=X_test_encoded,
+            #     lr_model=None, xgb_clf=None, X_train_scaled_bg=None, X_val_scaled=None,
+            #     xgb_booster=None,
+            #     use_streamlit=False
+            # )
+            # A_rf_array = attribs["rf"]  # (n_test, n_features)
+            
+            # # 2) Cache DF + position map (hashable surrogates)
+            # A_rf_full_df, pos_map = _rf_attr_cache(
+            #     A_rf_array,
+            #     _to_hashable_tuple(X_test_encoded.index),
+            #     _to_hashable_tuple(X_test_encoded.columns),
+            # )
+            
+            # # 3) Getter (reuse cache; recompute only for unseen perturbed rows)
+            # get_attr_rf_cached = make_get_attr_rf_cached(A_rf_full_df, pos_map)
+            
+            # 4) Sanity test UI
+            # with val_tab:
+            #     st.markdown("### Sanity (Random Forest)")
+            #     san = sanity_report(
+            #         model=tuned_model,
+            #         X_val=X_test_encoded,
+            #         y_val=y_test,
+            #         get_attribs_callable=get_attr_rf_cached,
+            #         randomize="labels",
+            #         seed=42
+            #     )
+            #     st.write(
+            #         f"Spearman ρ vs original after label randomization: "
+            #         f"**{san['spearman_rho_vs_original']:.3f}** "
+            #         "(should drop toward 0 if explanations depend on learned signal)"
+            #     )
+
+
+            # get_rf_explanation(tuned_model, background_data_encoded, X_test_encoded, shap_tab)
+            rf_local_shap_by_truth(tuned_model, X_test_encoded, X_test, y_test, 0.5418, shap_tab, background_data_encoded)
+            get_lime_explanations_binary(tuned_model, X_test, X_train_encoded, X_test_encoded, y_test, 0.5418, lime_tab, title_prefix="Local LIME – Random Forest")
+
+            rf_for_dice = ThresholdedModel(tuned_model, threshold=0.5418)
+
+            continuous_features = [
+                "tenure",
+                "MonthlyCharges",
+                "TotalCharges",          
+                "AvgMonthlyCharge",
+                "OnlineServiceCount",
+                "AvgPricePerService",
+            ]
+
+            features_to_vary = [
+                "PhoneService","MultipleLines","OnlineSecurity","OnlineBackup",
+                "DeviceProtection","TechSupport","StreamingTV","StreamingMovies",
+                "PaperlessBilling","MonthlyCharges",
+                "Contract_One year","Contract_Two year",
+                "PaymentMethod_Credit card (automatic)","PaymentMethod_Electronic check","PaymentMethod_Mailed check",
+                "InternetService_Fiber optic","InternetService_No",
+            ]
+
+            permitted_range = {"MonthlyCharges": [15, 150]}
+
+            results = get_counterfactual_analysis(
+            y_test=y_test,
+            X_test=X_test_encoded,          
+            X_train=X_train_encoded,
+            y_train=y_train,
+            model=rf_for_dice,              
+            continuous_features=continuous_features,
+            counterfactual_tab=counterfactual_tab,
+            features_to_vary=features_to_vary,
+            permitted_range=permitted_range,       # raw bounds
+            scaler=None,                           
+            numeric_feature_names_in_scaler_order=None,
+            immutable_features=immutable,
+            onehot_groups=onehot_groups
+        )
 
         elif selected_prediction_model == "XGBoost":
             # Train
@@ -211,15 +1124,416 @@ if selected_dataset in datasets:
             # print("\n[Stage 2] Best (refined):", best_stage2)
             row, bst, params = retrain_xgb_model(X_train_encoded, y_train, X_test_encoded, y_test, 
                                                  0.58, 0.05, 5, 0.872, 0.853, 0.715, 17.402, 0.006)
+
+            # def group_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.58, reference=None):
+            #     ref = reference or df[group_col].value_counts().idxmax()
+
+            #     def recall_pos(g):
+            #         mask = g[y_true] == 1
+            #         if mask.sum() == 0:
+            #             return np.nan
+            #         y_hat = (g[y_proba] >= threshold).astype(int)
+            #         return recall_score(g.loc[mask, y_true], y_hat[mask])
+
+            #     agg = (
+            #         df.groupby(group_col)
+            #           .apply(lambda g: pd.Series({
+            #               'n': len(g),
+            #               'observed_churn_rate': g[y_true].mean(),
+            #               'mean_pred_proba': g[y_proba].mean(),
+            #               f'prediction_rate@{threshold:.3f}': (g[y_proba] >= threshold).mean(),
+            #               'recall_pos': recall_pos(g),
+            #           }))
+            #           .reset_index()
+            #     )
+            #     ref_mean = agg.loc[agg[group_col] == ref, 'mean_pred_proba'].values[0]
+            #     agg[f'Δ_vs_{ref}'] = (agg['mean_pred_proba'] - ref_mean).abs()
+            #     agg['stat_parity_ok(≤0.05)'] = agg[f'Δ_vs_{ref}'] <= 0.05
+            #     return agg.sort_values('n', ascending=False), ref
+
+            # # --- config / inputs ---
+            # threshold = 0.58
+            # group_cols = ["gender", "SeniorCitizen", "Partner", "Dependents", "Contract", "PaymentMethod", "InternetService", "PaperlessBilling"]
+
+            # # IMPORTANT: use the RAW test DF for grouping, not the encoded/scaled matrix.
+            # X_test_original_groups = X_test[group_cols].copy()
+
+            # # y_true must be 0/1
+            # if isinstance(y_test, pd.DataFrame) and "Churn" in y_test.columns:
+            #     y_true = y_test["Churn"].map({"No": 0, "Yes": 1}).astype(int)
+            # elif getattr(y_test, "dtype", None) == object:
+            #     y_true = y_test.map({"No": 0, "Yes": 1}).astype(int)
+            # else:
+            #     y_true = y_test.astype(int)
+
+            # # Choose the feature matrix your Booster was trained on (typically encoded, not scaled unless you scaled during training)
+            # X_for_pred = X_test_encoded  # if your Booster was trained on the encoded matrix
+
+            # # --- normalize `tuned_model` to a dict of models ---
+            # models = {}
+            # # You can add more models here later; for now just the Booster:
+            # models["xgb_final"] = bst  # bst returned by retrain_xgb_model(...)
+
+            # def predict_proba_any(model, X):
+            #     # scikit-like estimators
+            #     if hasattr(model, "predict_proba"):
+            #         return model.predict_proba(X)[:, 1]
+            #     # XGBoost Booster
+            #     if isinstance(model, xgb.Booster):
+            #         # Ensure X is numpy/pandas -> DMatrix
+            #         dtest = xgb.DMatrix(X)
+            #         # For binary:logistic this returns probabilities
+            #         return model.predict(dtest)
+            #     # decision_function fallback (e.g., linear SVM)
+            #     if hasattr(model, "decision_function"):
+            #         from scipy.special import expit
+            #         return expit(model.decision_function(X))
+            #     # last resort: predict hard labels (not ideal)
+            #     yhat = model.predict(X)
+            #     return np.asarray(yhat).astype(float)
+
+            # # --- compute results ---
+            # results = {}
+            # for name, model in models.items():
+            #     y_proba = predict_proba_any(model, X_for_pred)
+
+            #     df_eval = X_test_original_groups.copy()
+            #     df_eval["y_true"]  = pd.Series(y_true.values, index=df_eval.index)
+            #     df_eval["y_proba"] = pd.Series(y_proba,       index=df_eval.index)
+
+            #     model_tables = {}
+            #     for gcol in group_cols:
+            #         sub = df_eval[[gcol, "y_true", "y_proba"]].dropna()
+            #         table, ref = group_fairness_table(sub, group_col=gcol, threshold=threshold)
+            #         model_tables[gcol] = (table, ref)
+            #     results[name] = model_tables
+
+            # # --- Streamlit UI ---
+            # st.title("Fairness Evaluation — Group-Based Metrics")
+            # st.write("Global threshold for recall comparisons (equal opportunity): ", threshold)
+            # for model_name, tables in results.items():
+            #     with st.expander(f"Model: {model_name}", expanded=False):
+            #         for gcol, (table, ref) in tables.items():
+            #             st.subheader(f"Group column: {gcol} (ref: {ref})")
+            #             st.dataframe(table, use_container_width=True)
+            #             csv_buf = StringIO()
+            #             table.to_csv(csv_buf, index=False)
+            #             st.download_button(
+            #                 label=f"Download CSV — {model_name} · {gcol}",
+            #                 data=csv_buf.getvalue(),
+            #                 file_name=f"fairness_{model_name}_{gcol}.csv",
+            #                 mime="text/csv"
+            #             )
             st.subheader("XGBoost Performance Analysis")
             metrics_tab, explainability_tab = st.tabs(["Metrics", "Explanation"])
             column2 = display_xgb_metrics(metrics_tab, row)
-            get_telco_metrics_caption(column2)
+            # get_telco_xgb_metrics_caption(column2)
 
             # Explainability models
-            shap_tab, lime_tabe = explainability_tab.tabs(["SHAP", "LIME"])
-            get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
+            # ---- SHAP attribution matrices for tests (Telco XGB) ----
+            attribs = collect_attributions_for_tests(
+                lr_model=None,
+                X_train_scaled_bg=None,
+                X_val_scaled=None,
+
+                rf_model=None,
+                xgb_clf=None,                           # you have a native Booster in `bst`
+                X_train_enc=X_train_encoded,
+                X_val_enc=X_test_encoded,
+
+                xgb_booster=bst,                        # native Booster path (pred_contribs)
+                use_streamlit=True
+            )
+            A_xgb_booster = attribs["xgb_booster"]     # (n_test, n_features_encoded), Δ log-odds
+            
+            # val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
+            shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
+
+            # Faithfulness
+            
+            # rep = faithfulness_report(
+            #     model=XGBoosterAdapter(bst, objective="binary:logistic"),
+            #     X_val=X_test_encoded,
+            #     y_val=y_test,
+            #     A=A_xgb_booster,
+            #     feature_names=X_test_encoded.columns.tolist(),
+            #     n_steps=10,
+            #     seed=42,
+            #     use_proba=True
+            # )
+            # val_tab.markdown("### Faithfulness")
+            # val_tab.write(f"Spearman ρ (rank vs. single-feature impact): **{rep['rho']:.3f}**")
+            # val_tab.dataframe(rep["curve"])
+
+            # x_row = X_test_encoded.iloc[0]
+            # a_row = pd.Series(A_xgb_booster[0], index=X_test_encoded.columns)
+
+            # rep = local_faithfulness_report(
+            #     model=bst,               # RF / LR / XGB model object
+            #     x_row=x_row,
+            #     a_row=a_row,
+            #     background=background_data_encoded,
+            #     n_draws=64,
+            #     n_steps=10,
+            #     replace_with="mean"              # or "draw"
+            # )
+            # val_tab.markdown("### Local Faithfulness (this customer)")
+            # val_tab.write(f"Spearman ρ (local): **{rep['rho_local']:.3f}**")
+            # val_tab.line_chart(pd.DataFrame({"p(k)": rep["deletion_curve"]["preds"]}, index=rep["deletion_curve"]["k"]))
+            # val_tab.caption(
+            #     f"Deletion curve AUC: {rep['deletion_curve']['auc']:.4f} (lower is better). "
+            #     f"Baseline p0={rep['deletion_curve']['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(rep['flip_k']) if rep['flip_k'] is not None else ''}"
+            # )
+            # val_tab.dataframe(rep["single_feature_impacts"].head(12).to_frame("local_impact"))
+
+            # X_train_for_lime = X_train_encoded  # use X_train_encoded for RF/XGB branches
+            # X_test_for_lime = X_test_encoded
+            # random_state = 42
+            # # choose a row to test (must be same feature space as the explainer/model)
+            # row_id = X_test_for_lime.index[0]           # e.g., scaled_X_test_features or X_test_encoded
+            # x_row = X_test_for_lime.loc[row_id]
+            # tuned_model = bst
+
+            # if hasattr(tuned_model, "predict_proba"):
+            #     # sklearn model (LR, RF, XGBClassifier)
+            #     predict_fn = tuned_model.predict_proba
+            #     class_names = [str(c) for c in getattr(tuned_model, "classes_", [0, 1])]
+            # else:
+            #     # native Booster (bst)
+            #     booster = bst if isinstance(bst, xgb.Booster) else bst.get_booster()
+            #     feat_names = X_train_for_lime.columns.tolist()
+            #     def predict_fn(X_batch: np.ndarray) -> np.ndarray:
+            #         dm = xgb.DMatrix(X_batch, feature_names=feat_names)
+            #         p1 = booster.predict(dm).reshape(-1)
+            #         return np.column_stack([1.0 - p1, p1])
+            #     class_names = ["0", "1"]
+
+            # # ---- Create LIME explainer on TRAIN data (same feature space as model) ----
+            # lime_explainer = LimeTabularExplainer(
+            #     training_data=X_train_for_lime.to_numpy(),
+            #     feature_names=X_train_for_lime.columns.tolist(),
+            #     class_names=class_names,
+            #     mode="classification",
+            #     discretize_continuous=True,
+            #     sample_around_instance=True,
+            #     random_state=42,
+            # )
+
+            # # ---- Run the tests (note: we pass predict_fn, not model) ----
+            # lt = lime_xgb_local_deletion_test(
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     predict_fn=predict_fn,
+            #     num_features=10,
+            #     k_max=10,
+            #     mask_strategy="mean",
+            # )
+            # val_tab.write(
+            #     f"Deletion curve AUC: **{lt['auc']:.4f}** (lower is better). "
+            #     f"Baseline p0={lt['p0']:.3f}. "
+            #     f"{'Flip at k='+str(lt['flip_k']) if lt['flip_k'] is not None else 'No flip'}."
+            # )
+
+            # corr = lime_xgb_local_rank_vs_impact(
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     predict_fn=predict_fn,
+            #     num_features=10,
+            #     mask_strategy="mean",
+            # )
+            # val_tab.write(
+            #     f"Spearman ρ (LIME rank vs single-feature impact): **{corr['rho']:.3f}** "
+            #     f"(p={corr['pval']:.3g})."
+            # )
+
+            # # Stability
+            # bst_patched = _patch_base_score_in_modelfile(bst)
+
+            # # # Then use this patched model instead of bst
+            # get_attr_xgb = lambda X: collect_attributions_for_tests(
+            #     xgb_booster=bst_patched,           # ✅ Use patched Booster, not rf_model
+            #     X_val_enc=X,
+            #     use_streamlit=False
+            # )["xgb_booster"]
+
+            # stab = stability_report(get_attr_xgb, X_test_encoded, n_boot=8, sample_frac=0.8, seed=42)
+
+            # val_tab.markdown("### Stability")
+            # val_tab.write(f"Kendall’s τ (mean ± sd): **{stab['kendall_tau_mean']:.3f} ± {stab['kendall_tau_std']:.3f}**")
+
+            # def _xgb_model_key(model) -> str:
+            #     """
+            #     Deterministic fingerprint for a trained XGBoost model.
+            #     Works for xgb.Booster and xgb.XGBClassifier.
+            #     """
+            #     # get raw bytes of the trained trees
+            #     if isinstance(model, xgb.Booster):
+            #         raw = model.save_raw()              # bytearray
+            #         raw_b = bytes(raw)                  # -> bytes
+            #         base = raw_b
+            #         extra = b""
+            #     elif hasattr(model, "get_booster"):     # XGBClassifier
+            #         booster = model.get_booster()
+            #         raw = booster.save_raw()            # bytearray
+            #         raw_b = bytes(raw)
+            #         base = raw_b
+            #         # include key hyperparams to be extra-safe
+            #         hp_names = ["n_estimators", "max_depth", "learning_rate", "subsample",
+            #                     "colsample_bytree", "colsample_bylevel", "colsample_bynode",
+            #                     "reg_lambda", "reg_alpha", "gamma", "min_child_weight", "random_state"]
+            #         hp_vals = tuple(getattr(model, n, None) for n in hp_names)
+            #         extra = repr(hp_vals).encode()
+            #     else:
+            #         # fallback
+            #         return hashlib.sha1(repr(model).encode()).hexdigest()
+
+            #     # stable digest string (streamlit-friendly)
+            #     return hashlib.sha1(base + extra).hexdigest()
+
+            # # 2) Cache full-test contribs (pred_contribs). Ignore unhashable model via leading underscore.
+            # @st.cache_data(show_spinner=False)
+            # def _xgb_full_attr(
+            #     _model,                 # not hashed by Streamlit
+            #     model_key: str,         # hashable fingerprint to invalidate cache when the model changes
+            #     feature_names: tuple,   # tuple(X_test_encoded.columns)
+            #     X_val_index: tuple,     # tuple(X_test_encoded.index)
+            #     X_val_values: np.ndarray
+            # ) -> pd.DataFrame:
+            #     # get Booster
+            #     if isinstance(_model, xgb.Booster):
+            #         booster = _model
+            #     elif hasattr(_model, "get_booster"):
+            #         check_is_fitted(_model)
+            #         booster = _model.get_booster()
+            #     else:
+            #         raise TypeError("Unsupported XGBoost model type for _xgb_full_attr")
+
+            #     feats = list(feature_names)
+            #     dm = xgb.DMatrix(X_val_values, feature_names=feats)
+            #     contribs = booster.predict(dm, pred_contribs=True)   # (n, p+1) last col = bias
+            #     A = contribs[:, :-1]                                 # drop bias to align with features
+            #     return pd.DataFrame(A, index=list(X_val_index), columns=feats)
+
+            # # 3) Pick which model to use for explanations
+            # try:
+            #     xgb_used = bst_patched   # if you patched base_score earlier
+            # except NameError:
+            #     xgb_used = bst           # Booster returned by retrain_xgb_model(...)
+
+            # # Build cache
+            # xgb_key = _xgb_model_key(xgb_used)
+            # A_xgb_full = _xgb_full_attr(
+            #     _model=xgb_used,
+            #     model_key=xgb_key,
+            #     feature_names=tuple(X_test_encoded.columns.tolist()),
+            #     X_val_index=tuple(X_test_encoded.index.tolist()),
+            #     X_val_values=X_test_encoded.to_numpy(),
+            # )
+
+            # # Getter: reuse cache for existing rows; recompute contribs only for perturbed rows
+            # def get_attr_xgb_cached(X_batch: pd.DataFrame) -> np.ndarray:
+            #     try:
+            #         return A_xgb_full.loc[X_batch.index].to_numpy()
+            #     except KeyError:
+            #         feats = X_batch.columns.tolist()
+            #         booster = xgb_used if isinstance(xgb_used, xgb.Booster) else xgb_used.get_booster()
+            #         dm = xgb.DMatrix(X_batch[feats].to_numpy(), feature_names=feats)
+            #         contribs = booster.predict(dm, pred_contribs=True)
+            #         return contribs[:, :-1]
+
+            # # 4) Local stability UI
+            # with val_tab:
+            #     st.markdown("### Local Stability (XGBoost)")
+            #     xgb_row_id = st.selectbox("Pick a row (XGB):", X_test_encoded.index.tolist(), index=0, key="xgb_row_pick")
+            #     n_pert = st.slider("Perturbations", 10, 100, 30, key="xgb_npert")
+            #     noise = st.number_input("Numeric noise (σ)", 0.0, 1.0, 0.02, 0.01, key="xgb_noise")
+            #     flip  = st.number_input("Flip prob (binary/one-hot)", 0.0, 1.0, 0.05, 0.01, key="xgb_flip")
+
+            #     # One-hots are strictly {0,1}; the rest numeric
+            #     binary_cols_xgb  = [c for c in X_test_encoded.columns
+            #                         if set(pd.unique(X_test_encoded[c])).issubset({0, 1})]
+            #     numeric_cols_xgb = [c for c in X_test_encoded.columns if c not in binary_cols_xgb]
+
+                # if st.button("Run local stability (XGB)"):
+                #     report = local_stability_report_generic(
+                #         get_attr_for_batch=get_attr_xgb_cached,
+                #         X_matrix=X_test_encoded,
+                #         row_id=xgb_row_id,
+                #         numeric_cols=numeric_cols_xgb,
+                #         binary_cols=binary_cols_xgb,
+                #         onehot_groups=onehot_groups,   # your existing dict
+                #         n_perturb=n_pert,
+                #         noise_scale=noise,
+                #         flip_prob=flip,
+                #         k_list=(5, 10)
+                #     )
+                #     st.write(f"Kendall’s τ (mean): **{report['kendall_tau_mean']:.3f}**")
+                #     st.write(f"Spearman ρ (mean): **{report['spearman_rho_mean']:.3f}**")
+                #     st.write(f"Avg std(|attrib|): **{report['mean_attr_std']:.4f}**")
+                #     st.write({f"Top-{k} overlap": f"{report['topk_overlap_mean'][k]:.2f}" for k in (5, 10)})
+                #     st.dataframe(report["attr_std_by_feature"].head(12).to_frame("std").style.format({"std": "{:.4f}"}))
+
+            # Sanity (label randomization)
+            # san = sanity_report(
+            #     model=bst,
+            #     X_val=X_test_encoded,
+            #     y_val=y_test,
+            #     get_attribs_callable=get_attr_xgb,
+            #     randomize="labels",
+            #     seed=42
+            # )
+            # val_tab.markdown("### Sanity")
+            # val_tab.write(f"Spearman ρ vs original after label randomization: **{san['spearman_rho_vs_original']:.3f}** "
+            #               "(should drop toward 0 if explanations depend on learned signal)")
+
+
+            # get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
+            xgb_local_shap_by_truth(bst, X_test_encoded, X_test, y_test, 0.58, shap_tab, background_data_encoded)
+            get_lime_explanations_binary(bst, X_test, X_train_encoded, X_test_encoded, y_test, 0.58, lime_tab, title_prefix="Local LIME – XGBoost")
         
+            adapted = XGBoosterAdapter(bst, objective="binary:logistic")
+            xgb_for_dice = ThresholdedModel(adapted, threshold=0.58)
+
+            continuous_features = [
+                "tenure",
+                "MonthlyCharges",
+                "TotalCharges",          
+                "AvgMonthlyCharge",
+                "OnlineServiceCount",
+                "AvgPricePerService",
+            ]
+
+            features_to_vary = [
+                "PhoneService","MultipleLines","OnlineSecurity","OnlineBackup",
+                "DeviceProtection","TechSupport","StreamingTV","StreamingMovies",
+                "PaperlessBilling","MonthlyCharges",
+                "Contract_One year","Contract_Two year",
+                "PaymentMethod_Credit card (automatic)","PaymentMethod_Electronic check","PaymentMethod_Mailed check",
+                "InternetService_Fiber optic","InternetService_No",
+            ]
+
+            permitted_range = {"MonthlyCharges": [15, 150]}
+
+            results = get_counterfactual_analysis(
+            y_test=y_test,
+            X_test=X_test_encoded,          
+            X_train=X_train_encoded,
+            y_train=y_train,
+            model=xgb_for_dice,              
+            continuous_features=continuous_features,
+            counterfactual_tab=counterfactual_tab,
+            features_to_vary=features_to_vary,
+            permitted_range=permitted_range,       # raw bounds
+            scaler=None,                           
+            numeric_feature_names_in_scaler_order=None,
+            immutable_features=immutable,
+            onehot_groups=onehot_groups
+        )
+
+
     # Display internet dataset's null values in a heatmap
     else:
         selected_anaysis_type = st.sidebar.selectbox(
@@ -304,58 +1618,1006 @@ if selected_dataset in datasets:
         X_train_encoded = encode_internet_data(X_train)
         X_test_encoded = encode_internet_data(X_test)
 
-        scaled_X_train_features, scaled_X_test_features = get_scaled_internet_features(X_train_encoded, X_test_encoded)
+        scaler, scaled_X_train_features, scaled_X_test_features, num_cols_in_scaler_order = get_scaled_internet_features(X_train_encoded, X_test_encoded)
+        background_data_scaled = (
+            scaled_X_train_features
+                .assign(Churn=y_train.values)
+                .groupby('Churn', group_keys=False)
+                .apply(lambda x: x.sample(frac=1000/len(scaled_X_train_features), random_state=42))
+                .drop(columns='Churn')
+            )      
 
+        background_data_encoded = (
+            X_train_encoded
+                .assign(Churn=y_train.values)
+                .groupby('Churn', group_keys=False)
+                .apply(lambda x: x.sample(frac=1000/len(scaled_X_train_features), random_state=42))
+                .drop(columns='Churn')
+            )
+        #-------------------------------
         #------------------- Train models -----------------------------
-
+        
         cross_validation = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        immutable = {"subscription_age", "download_avg", "upload_avg", "total_usage", "usage_tier_Medium", "usage_tier_Heavy"}
+        onehot_groups = {
+            "total_usage": ["usage_tier_Medium","usage_tier_Heavy"],
+            "subscription_age": ["contract_stage_0.5-1y", "contract_stage_1-2y", "contract_stage_>2y", "contract_stage_no_contract"]
+        }
         if selected_prediction_model == 'Logistic Regression':
             
             # perform_primary_lg_training(scaled_X_train_features, y_train, scaled_X_test_features, y_test, None)
             # cross_validate_lg_model(X_train_encoded, y_train, cross_validation, None)
             # hyperparameter_tune_lg(X_train_encoded, y_train, cross_validation)
-            metrics = retrain_lg_model(scaled_X_train_features, y_train, scaled_X_test_features, y_test, 0.408, 0.01)
+            metrics, tuned_model = retrain_lg_model(scaled_X_train_features, y_train, scaled_X_test_features, y_test, 0.408, 0.01)
+
+            # def group_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.408, reference=None):
+            #     """Return a per-group fairness table and the chosen reference group."""
+            #     # pick reference = largest group if not provided
+            #     ref = reference or df[group_col].value_counts().idxmax()
+
+            #     def recall_pos(g):
+            #         mask = g[y_true] == 1
+            #         if mask.sum() == 0:
+            #             return np.nan
+            #         y_hat = (g[y_proba] >= threshold).astype(int)
+            #         return recall_score(g.loc[mask, y_true], y_hat[mask])
+
+            #     agg = (
+            #         df.groupby(group_col)
+            #           .apply(lambda g: pd.Series({
+            #               'n': len(g),
+            #               'observed_churn_rate': g[y_true].mean(),
+            #               'mean_pred_proba': g[y_proba].mean(),
+            #               f'prediction_rate@{threshold:.3f}': (g[y_proba] >= threshold).mean(),
+            #               'recall_pos': recall_pos(g),
+            #           }))
+            #           .reset_index()
+            #     )
+
+            #     ref_mean = agg.loc[agg[group_col] == ref, 'mean_pred_proba'].values[0]
+            #     agg[f'Δ_vs_{ref}'] = (agg['mean_pred_proba'] - ref_mean).abs()
+            #     agg['stat_parity_ok(≤0.05)'] = agg[f'Δ_vs_{ref}'] <= 0.05
+            #     return agg.sort_values('n', ascending=False), ref
+
+            # group_cols = ["contract_stage", "bill_bucket", "usage_tier", "fail_count_bucket",]  
+            # threshold = 0.408
+            # X_test_original_groups = X_test[group_cols].copy()
+            # if hasattr(y_test, "dtype") and y_test.dtype == object:
+            #     y_true = y_test.map({"No": 0, "Yes": 1}).astype(int)
+            # elif isinstance(y_test, pd.DataFrame) and "Churn" in y_test.columns:
+            #     y_true = y_test["Churn"].map({"No": 0, "Yes": 1}).astype(int)
+            # else:
+            #     y_true = y_test.astype(int)  # already 0/1
+
+            # if hasattr(tuned_model, "predict_proba"):           # single estimator
+            #     models = {"logreg_final": tuned_model}
+            # elif isinstance(tuned_model, (list, tuple)):        # list/tuple of estimators
+            #     models = {f"model_{i}": m for i, m in enumerate(tuned_model)}
+            # elif isinstance(tuned_model, dict):                  # already a dict
+            #     models = tuned_model
+            # else:
+            #     raise TypeError("tuned_model must be an estimator, list/tuple of estimators, or dict.")
+
+            # X_for_pred = scaled_X_test_features
+
+            # results = {}
+            # for name, model in models.items():
+            #     # get probabilities for the positive class
+            #     y_proba = model.predict_proba(X_for_pred)[:, 1]
+
+            #     # build evaluation frame aligned by index
+            #     df_eval = X_test_original_groups.copy()
+            #     df_eval["y_true"] = pd.Series(y_true.values, index=df_eval.index)
+            #     df_eval["y_proba"] = pd.Series(y_proba, index=df_eval.index)
+
+            # # per-group tables for this model
+            #     model_tables = {}
+            #     for gcol in group_cols:
+            #         sub = df_eval[[gcol, "y_true", "y_proba"]].dropna()
+            #         table, ref = group_fairness_table(
+            #             sub, group_col=gcol, y_true="y_true", y_proba="y_proba", threshold=threshold
+            #         )
+            #         model_tables[gcol] = (table, ref)
+            #     results[name] = model_tables
+
+            # st.title("Fairness Evaluation — Group-Based Metrics")
+            # st.write("Global threshold for recall comparisons (equal opportunity): ", threshold)
+
+            # for model_name, tables in results.items():
+            #     with st.expander(f"Model: {model_name}", expanded=False):
+            #         for gcol, (table, ref) in tables.items():
+            #             st.subheader(f"Group column: {gcol} (ref: {ref})")
+            #             st.dataframe(table, use_container_width=True)
+
+            #             # CSV download
+            #             csv_buf = StringIO()
+            #             table.to_csv(csv_buf, index=False)
+            #             st.download_button(
+            #                 label=f"Download CSV — {model_name} · {gcol}",
+            #                 data=csv_buf.getvalue(),
+            #                 file_name=f"fairness_{model_name}_{gcol}.csv",
+            #                 mime="text/csv"
+            #             )
+
             st.subheader("Logistic Regression Performance Analysis")
             metrics_tab, explainability_tab = st.tabs(["Metrics", "Explanation"])
             column2 = display_lr_metrics(metrics_tab, metrics)
-            get_internet_metrics_caption(column2)
+            get_internet_lr_metrics_caption(column2)
 
-            models = ["Logistic Regression", "Random Forest", "XGBoost"]
-            f1_scores = [0.88, 0.92, 0.92]
+            # Explainability models
+            attribs = collect_attributions_for_tests(
+                lr_model=tuned_model,
+                X_train_scaled_bg=scaled_X_train_features.sample(200, random_state=0),
+                X_val_scaled=scaled_X_test_features,
 
-            df = pd.DataFrame({"Model": models, "F1": f1_scores})
+                rf_model=None,
+                xgb_clf=None,
+                X_train_enc=None,
+                X_val_enc=None,
 
-            # Highlight the best bar
-            best = df["F1"].max()
-            df["color"] = df["F1"].apply(lambda x: "#6baed6" if x == best else "#b0b0b0")  # blue for best
-
-            # Plotly Express bar chart
-            fig = px.bar(
-                df, x="Model", y="F1",
-                text=df["F1"].map(lambda x: f"{x:.3f}"),
-                color="color", color_discrete_map="identity",
-                range_y=[0, 1.0]
+                xgb_booster=None,
+                use_streamlit=True
             )
+            # Explainability models
+            attribs = collect_attributions_for_tests(
+                lr_model=tuned_model,
+                X_train_scaled_bg=scaled_X_train_features.sample(200, random_state=0),
+                X_val_scaled=scaled_X_test_features,
 
-            fig.update_traces(textposition="outside", hovertemplate="<b>%{x}</b><br>F1=%{y:.3f}<extra></extra>")
-            fig.update_layout(showlegend=False, yaxis_title="F1-score", xaxis_title="Model", xaxis_tickangle=-90, margin=dict(b=80))
+                rf_model=None,
+                xgb_clf=None,
+                X_train_enc=None,
+                X_val_enc=None,
 
-            # In a script: fig.show()
-            # In Streamlit:
-            # import streamlit as st
-            column3, col4 = st.columns([1, 1])
-            column3.plotly_chart(fig, use_container_width=True)
+                xgb_booster=None,
+                use_streamlit=True
+            )
+            A_lr = attribs["lr"]
+
+            # val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
+            shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
+
+
+            # Faithfulness
+            
+            # rep = faithfulness_report(
+            #     model=tuned_model,
+            #     X_val=scaled_X_test_features,
+            #     y_val=y_test,
+            #     A=A_lr,
+            #     feature_names=scaled_X_test_features.columns.tolist(),
+            #     n_steps=10,
+            #     seed=42,
+            #     use_proba=True
+            # )
+            # val_tab.markdown("### Faithfulness")
+            # val_tab.write(f"Spearman ρ (rank vs. single-feature impact): **{rep['rho']:.3f}**")
+            # val_tab.dataframe(rep["curve"])
+
+            # x_row = scaled_X_test_features.iloc[0]
+            # a_row = pd.Series(A_lr[0], index=scaled_X_test_features.columns)
+
+            # rep = local_faithfulness_report(
+            #     model=tuned_model,               # RF / LR / XGB model object
+            #     x_row=x_row,
+            #     a_row=a_row,
+            #     background=background_data_scaled,
+            #     n_draws=64,
+            #     n_steps=10,
+            #     replace_with="mean"              # or "draw"
+            # )
+            # val_tab.markdown("### Local Faithfulness (this customer)")
+            # val_tab.write(f"Spearman ρ (local): **{rep['rho_local']:.3f}**")
+            # val_tab.line_chart(pd.DataFrame({"p(k)": rep["deletion_curve"]["preds"]}, index=rep["deletion_curve"]["k"]))
+            # val_tab.caption(
+            #     f"Deletion curve AUC: {rep['deletion_curve']['auc']:.4f} (lower is better). "
+            #     f"Baseline p0={rep['deletion_curve']['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(rep['flip_k']) if rep['flip_k'] is not None else ''}"
+            # )
+            # val_tab.dataframe(rep["single_feature_impacts"].head(12).to_frame("local_impact"))
+
+            # X_train_for_lime = scaled_X_train_features  # use X_train_encoded for RF/XGB branches
+            # X_test_for_lime = scaled_X_test_features
+            # random_state = 42
+            # # choose a row to test (must be same feature space as the explainer/model)
+            # row_id = X_test_for_lime.index[0]           # e.g., scaled_X_test_features or X_test_encoded
+            # x_row = X_test_for_lime.loc[row_id]
+
+            # lime_explainer = LimeTabularExplainer(
+            #     training_data=X_train_for_lime.to_numpy(),
+            #     feature_names=X_train_for_lime.columns.tolist(),
+            #     class_names=[str(c) for c in getattr(tuned_model, "classes_", [0, 1])],  # <-- FIXED
+            #     mode="classification",
+            #     discretize_continuous=True,
+            #     sample_around_instance=True,
+            #     random_state=random_state,
+            # )
+
+            # lt = lime_local_deletion_test(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     k_max=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Deletion curve AUC: **{lt['auc']:.4f}** (lower is better). "
+            #     f"Baseline p0={lt['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(lt['flip_k']) if lt['flip_k'] is not None else 'No flip'}."
+            # )
+
+            # corr = lime_local_rank_vs_impact(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Spearman ρ (LIME rank vs single-feature impact): **{corr['rho']:.3f}** "
+            #     f"(p={corr['pval']:.3g})."
+            # )
+
+            # # Stability
+            # get_attr_lr = lambda X: collect_attributions_for_tests(
+            #     lr_model=tuned_model,
+            #     X_train_scaled_bg=scaled_X_train_features.sample(200, random_state=0),
+            #     X_val_scaled=X,
+            #     use_streamlit=False
+            # )["lr"]
+            # stab = stability_report(get_attr_lr, scaled_X_test_features, n_boot=8, sample_frac=0.8, seed=42)
+            # val_tab.markdown("### Stability")
+            # val_tab.write(f"Kendall’s τ (mean ± sd): **{stab['kendall_tau_mean']:.3f} ± {stab['kendall_tau_std']:.3f}**")
+
+            # X_train_for_lime = scaled_X_train_features  # use X_train_encoded for RF/XGB branches
+            # X_test_for_lime = scaled_X_test_features
+            # random_state = 42
+            # # choose a row to test (must be same feature space as the explainer/model)
+            # row_id = X_test_for_lime.index[0]           # e.g., scaled_X_test_features or X_test_encoded
+            # x_row = X_test_for_lime.loc[row_id]
+
+            # lime_explainer = LimeTabularExplainer(
+            #     training_data=X_train_for_lime.to_numpy(),
+            #     feature_names=X_train_for_lime.columns.tolist(),
+            #     class_names=[str(c) for c in getattr(tuned_model, "classes_", [0, 1])],  # <-- FIXED
+            #     mode="classification",
+            #     discretize_continuous=True,
+            #     sample_around_instance=True,
+            #     random_state=random_state,
+            # )
+
+            # lt = lime_local_deletion_test(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     k_max=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Deletion curve AUC: **{lt['auc']:.4f}** (lower is better). "
+            #     f"Baseline p0={lt['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(lt['flip_k']) if lt['flip_k'] is not None else 'No flip'}."
+            # )
+
+            # corr = lime_local_rank_vs_impact(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Spearman ρ (LIME rank vs single-feature impact): **{corr['rho']:.3f}** "
+            #     f"(p={corr['pval']:.3g})."
+            # )
+
+            # Stability
+            # get_attr_lr = lambda X: collect_attributions_for_tests(
+            #     lr_model=tuned_model,
+            #     X_train_scaled_bg=scaled_X_train_features.sample(200, random_state=0),
+            #     X_val_scaled=X,
+            #     use_streamlit=False
+            # )["lr"]
+            # stab = stability_report(get_attr_lr, scaled_X_test_features, n_boot=20, sample_frac=0.8, seed=42)
+            # val_tab.markdown("### Stability")
+            # val_tab.write(f"Kendall’s τ (mean ± sd): **{stab['kendall_tau_mean']:.3f} ± {stab['kendall_tau_std']:.3f}**")
+
+
+            # --- 1) Build a hashable fingerprint for LR ---
+            # --- Hashable fingerprint for LR (for cache invalidation) ---
+            # def _lr_model_key(m: LogisticRegression) -> str:
+            #     coef = getattr(m, "coef_", None)
+            #     intercept = getattr(m, "intercept_", None)
+            #     n_iter = getattr(m, "n_iter_", None)
+            #     parts = []
+            #     if coef is not None:      parts.append(coef.ravel().tobytes())
+            #     if intercept is not None: parts.append(np.atleast_1d(intercept).ravel().tobytes())
+            #     if n_iter is not None:    parts.append(np.atleast_1d(n_iter).ravel().tobytes())
+            #     parts.append(str(getattr(m, "C", None)).encode())
+            #     parts.append(str(getattr(m, "penalty", None)).encode())
+            #     parts.append(str(getattr(m, "solver", None)).encode())
+            #     return str(abs(hash(b"||".join(parts))))
+
+            # @st.cache_data(show_spinner=False)
+            # def _lr_full_attr(
+            #     _model: LogisticRegression,  # ignored by Streamlit hasher (leading underscore)
+            #     model_key: str,
+            #     X_train_bg: pd.DataFrame,
+            #     X_val_scaled: pd.DataFrame,
+            # ) -> pd.DataFrame:
+            #     A = collect_attributions_for_tests(
+            #         lr_model=_model,
+            #         X_train_scaled_bg=X_train_bg,
+            #         X_val_scaled=X_val_scaled,
+            #         rf_model=None, xgb_clf=None,
+            #         X_train_enc=None, X_val_enc=None,
+            #         xgb_booster=None,
+            #         use_streamlit=False
+            #     )["lr"]
+            #     return pd.DataFrame(A, index=X_val_scaled.index, columns=X_val_scaled.columns)
+
+            # # --- use it (always pass model_key!) ---
+            # lr_key   = _lr_model_key(tuned_model)
+            # bg_sample = scaled_X_train_features.sample(min(200, len(scaled_X_train_features)), random_state=0)
+
+            # A_lr_full = _lr_full_attr(
+            #     _model=tuned_model,
+            #     model_key=lr_key,
+            #     X_train_bg=bg_sample,
+            #     X_val_scaled=scaled_X_test_features,
+            # )
+
+            # def get_attr_lr_cached(X_batch: pd.DataFrame) -> np.ndarray:
+            #     # try reuse from full cache
+            #     try:
+            #         return A_lr_full.loc[X_batch.index].to_numpy()
+            #     except KeyError:
+            #         # small recompute for perturbed rows not in A_lr_full
+            #         A_tmp = collect_attributions_for_tests(
+            #             lr_model=tuned_model,
+            #             X_train_scaled_bg=bg_sample,
+            #             X_val_scaled=X_batch,
+            #             use_streamlit=False
+            #         )["lr"]
+            #         return A_tmp
+
+            # with val_tab:
+            #     st.markdown("### Local Stability (Logistic Regression)")
+            #     lr_row_id = st.selectbox("Pick a row (LR):", scaled_X_test_features.index.tolist(), index=0, key="lr_row_pick")
+            #     n_pert = st.slider("Perturbations", 10, 100, 30, key="lr_npert")
+            #     noise = st.number_input("Numeric noise (σ)", min_value=0.0, max_value=1.0, value=0.02, step=0.01, key="lr_noise")
+            #     flip = st.number_input("Flip prob (binary/one-hot)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, key="lr_flip")
+
+            #     if st.button("Run local stability (LR)"):
+            #         # In the scaled matrix, nearly everything is numeric; treat one-hots as binary [0/1].
+            #         numeric_cols = scaled_X_test_features.columns.tolist()
+            #         # If you can enumerate true one-hots, pass them here; otherwise an empty dict is safe.
+            #         report = local_stability_report_generic(
+            #             get_attr_for_batch=get_attr_lr_cached,
+            #             X_matrix=scaled_X_test_features,
+            #             row_id=lr_row_id,
+            #             numeric_cols=numeric_cols,
+            #             binary_cols=[],                    # (optional) add pure binary cols here if you keep them separate
+            #             onehot_groups=onehot_groups,       # if columns exist in scaled matrix with same names
+            #             n_perturb=n_pert,
+            #             noise_scale=noise,
+            #             flip_prob=flip,
+            #             k_list=(5,10)
+            #         )
+            #         st.write(f"Kendall’s τ (mean): **{report['kendall_tau_mean']:.3f}**")
+            #         st.write(f"Spearman ρ (mean): **{report['spearman_rho_mean']:.3f}**")
+            #         st.write(f"Avg std(|attrib|): **{report['mean_attr_std']:.4f}**")
+            #         st.write({f"Top-{k} overlap": f"{report['topk_overlap_mean'][k]:.2f}" for k in (5,10)})
+            #         st.dataframe(report["attr_std_by_feature"].head(12).to_frame("std").style.format({"std": "{:.4f}"}))
+
+
+            # Sanity (label randomization)
+            # san = sanity_report(
+            # model=tuned_model,
+            # X_val=scaled_X_test_features,
+            # y_val=y_test,
+            # get_attribs_callable=get_attr_lr_cached,  # <-- new name
+            # randomize="labels",
+            # seed=42
+            # )
+            # val_tab.markdown("### Sanity")
+            # val_tab.write(f"Spearman ρ vs original after label randomization: **{san['spearman_rho_vs_original']:.3f}** "
+            #               "(should drop toward 0 if explanations depend on learned signal)")
+
+
+            # get_lr_explanation(tuned_model, background_data_scaled, scaled_X_test_features, shap_tab)
+            lr_local_shap_by_truth(
+                lr_model=tuned_model,
+                background_data=background_data_scaled,
+                X_test_scaled=scaled_X_test_features,
+                X_test=X_test,
+                y_test=y_test,             # must be aligned with X_test_scaled index
+                shap_tab=shap_tab,
+                threshold=0.408,            # your operating threshold
+                top_display=12
+                )
+            get_lime_explanations_binary(tuned_model, X_test, scaled_X_train_features, scaled_X_test_features, y_test, 0.408, lime_tab, title_prefix="Local LIME – Logistic Regression")      
+
+
+            lr_for_dice = ThresholdedModel(tuned_model, threshold=0.408)
+            
+            continuous_features = [
+                "subscription_age",
+                "bill_avg",
+                "service_failure_count",          
+                "download_avg",
+                "upload_avg",
+                "total_usage",
+                "services_count",
+                "download_over_limit"
+            ]
+
+            features_to_vary = [
+                "is_tv_subscriber", "is_movie_package_subscriber", 
+                "bill_avg",
+                "download_over_limit",
+                "contract_stage_0.5-1y", "contract_stage_1-2y", "contract_stage_>2y", "contract_stage_no_contract"
+            ]
+
+            permitted_range = {"bill_avg": [15, 150]}
+
+            results = get_counterfactual_analysis(
+                y_test=y_test,
+                X_test=scaled_X_test_features,
+                X_train=scaled_X_train_features,
+                y_train=y_train,
+                model=lr_for_dice,                         # must expose predict_proba
+                continuous_features=continuous_features,
+                counterfactual_tab=counterfactual_tab,
+                outcome_name="Churn",
+                total_CFs=6,
+                features_to_vary=features_to_vary,                    # or "all"
+                permitted_range={"MonthlyCharges":[15,150]},
+                scaler=scaler,
+                numeric_feature_names_in_scaler_order=num_cols_in_scaler_order,
+                immutable_features=immutable,
+                onehot_groups=onehot_groups,
+            )
 
         elif selected_prediction_model == 'Random Forest':
             
             # perform_primary_rf_training(X_train_encoded, y_train, X_test_encoded, y_test, None)
             # cross_validate_rf_model(X_train_encoded, y_train, cross_validation, None)
             # hyperparameter_tune_rf(X_train_encoded, y_train, cross_validation)
-            metrics = retrain_rf_model(X_train_encoded, y_train, X_test_encoded, y_test, 0.426, 609, 10, 3, 0.9, 28)
+            metrics, tuned_model = retrain_rf_model(X_train_encoded, y_train, X_test_encoded, y_test, 0.426, 609, 10, 3, 0.9, 28)
+
+            # def group_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.426, reference=None):
+            #     """Return a per-group fairness table and the chosen reference group."""
+            #     # pick reference = largest group if not provided
+            #     ref = reference or df[group_col].value_counts().idxmax()
+
+            #     def recall_pos(g):
+            #         mask = g[y_true] == 1
+            #         if mask.sum() == 0:
+            #             return np.nan
+            #         y_hat = (g[y_proba] >= threshold).astype(int)
+            #         return recall_score(g.loc[mask, y_true], y_hat[mask])
+
+            #     agg = (
+            #         df.groupby(group_col)
+            #           .apply(lambda g: pd.Series({
+            #               'n': len(g),
+            #               'observed_churn_rate': g[y_true].mean(),
+            #               'mean_pred_proba': g[y_proba].mean(),
+            #               f'prediction_rate@{threshold:.3f}': (g[y_proba] >= threshold).mean(),
+            #               'recall_pos': recall_pos(g),
+            #           }))
+            #           .reset_index()
+            #     )
+
+            #     ref_mean = agg.loc[agg[group_col] == ref, 'mean_pred_proba'].values[0]
+            #     agg[f'Δ_vs_{ref}'] = (agg['mean_pred_proba'] - ref_mean).abs()
+            #     agg['stat_parity_ok(≤0.05)'] = agg[f'Δ_vs_{ref}'] <= 0.05
+            #     return agg.sort_values('n', ascending=False), ref
+
+            # group_cols = ["contract_stage", "bill_bucket", "usage_tier", "fail_count_bucket",]  
+            # threshold = 0.426
+            # X_test_original_groups = X_test[group_cols].copy()
+            # if hasattr(y_test, "dtype") and y_test.dtype == object:
+            #     y_true = y_test.map({"No": 0, "Yes": 1}).astype(int)
+            # elif isinstance(y_test, pd.DataFrame) and "Churn" in y_test.columns:
+            #     y_true = y_test["Churn"].map({"No": 0, "Yes": 1}).astype(int)
+            # else:
+            #     y_true = y_test.astype(int)  # already 0/1
+
+            # if hasattr(tuned_model, "predict_proba"):           # single estimator
+            #     models = {"logreg_final": tuned_model}
+            # elif isinstance(tuned_model, (list, tuple)):        # list/tuple of estimators
+            #     models = {f"model_{i}": m for i, m in enumerate(tuned_model)}
+            # elif isinstance(tuned_model, dict):                  # already a dict
+            #     models = tuned_model
+            # else:
+            #     raise TypeError("tuned_model must be an estimator, list/tuple of estimators, or dict.")
+
+            # X_for_pred = X_test_encoded
+
+            # results = {}
+            # for name, model in models.items():
+            #     # get probabilities for the positive class
+            #     y_proba = model.predict_proba(X_for_pred)[:, 1]
+
+            #     # build evaluation frame aligned by index
+            #     df_eval = X_test_original_groups.copy()
+            #     df_eval["y_true"] = pd.Series(y_true.values, index=df_eval.index)
+            #     df_eval["y_proba"] = pd.Series(y_proba, index=df_eval.index)
+
+            # # per-group tables for this model
+            #     model_tables = {}
+            #     for gcol in group_cols:
+            #         sub = df_eval[[gcol, "y_true", "y_proba"]].dropna()
+            #         table, ref = group_fairness_table(
+            #             sub, group_col=gcol, y_true="y_true", y_proba="y_proba", threshold=threshold
+            #         )
+            #         model_tables[gcol] = (table, ref)
+            #     results[name] = model_tables
+
+            # st.title("Fairness Evaluation — Group-Based Metrics")
+            # st.write("Global threshold for recall comparisons (equal opportunity): ", threshold)
+            # for model_name, tables in results.items():
+            #     with st.expander(f"Model: {model_name}", expanded=False):
+            #         for gcol, (table, ref) in tables.items():
+            #             st.subheader(f"Group column: {gcol} (ref: {ref})")
+            #             st.dataframe(table, use_container_width=True)
+
+            #             # CSV download
+            #             csv_buf = StringIO()
+            #             table.to_csv(csv_buf, index=False)
+            #             st.download_button(
+            #                 label=f"Download CSV — {model_name} · {gcol}",
+            #                 data=csv_buf.getvalue(),
+            #                 file_name=f"fairness_{model_name}_{gcol}.csv",
+            #                 mime="text/csv"
+            #             )
+
+
             st.subheader("Random Forest Performance Analysis")
             metrics_tab, explainability_tab = st.tabs(["Metrics", "Explanation"])
             column2 = display_rf_metrics(metrics_tab, metrics)
-            get_internet_metrics_caption(column2)
+            get_internet_rf_metrics_caption(column2)
+
+            # Explainability models
+            attribs = collect_attributions_for_tests(
+                lr_model=None,
+                X_train_scaled_bg=None,
+                X_val_scaled=None,
+
+                rf_model=tuned_model,
+                xgb_clf=None,
+                X_train_enc=X_train_encoded,
+                X_val_enc=X_test_encoded,
+
+                xgb_booster=None,
+                use_streamlit=True
+            )
+            A_rf = attribs["rf"] 
+
+            val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
+            shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
+
+            # Faithfulness
+            
+            # rep = faithfulness_report(
+            #     model=tuned_model,
+            #     X_val=X_test_encoded,
+            #     y_val=y_test,
+            #     A=A_rf,
+            #     feature_names=X_test_encoded.columns.tolist(),
+            #     n_steps=10,
+            #     seed=42,
+            #     use_proba=True
+            # )
+            # val_tab.markdown("### Faithfulness")
+            # val_tab.write(f"Spearman ρ (rank vs. single-feature impact): **{rep['rho']:.3f}**")
+            # val_tab.dataframe(rep["curve"])
+
+            # x_row = X_test_encoded.iloc[0]
+            # a_row = pd.Series(A_rf[0], index=X_test_encoded.columns)
+
+            # rep = local_faithfulness_report(
+            #     model=tuned_model,               # RF / LR / XGB model object
+            #     x_row=x_row,
+            #     a_row=a_row,
+            #     background=background_data_encoded,
+            #     n_draws=64,
+            #     n_steps=10,
+            #     replace_with="mean"              # or "draw"
+            # )
+            # val_tab.markdown("### Local Faithfulness (this customer)")
+            # val_tab.write(f"Spearman ρ (local): **{rep['rho_local']:.3f}**")
+            # val_tab.line_chart(pd.DataFrame({"p(k)": rep["deletion_curve"]["preds"]}, index=rep["deletion_curve"]["k"]))
+            # val_tab.caption(
+            #     f"Deletion curve AUC: {rep['deletion_curve']['auc']:.4f} (lower is better). "
+            #     f"Baseline p0={rep['deletion_curve']['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(rep['flip_k']) if rep['flip_k'] is not None else ''}"
+            # )
+            # val_tab.dataframe(rep["single_feature_impacts"].head(12).to_frame("local_impact"))
+
+            # X_train_for_lime = X_train_encoded  # use X_train_encoded for RF/XGB branches
+            # X_test_for_lime = X_test_encoded
+            # random_state = 42
+            # # choose a row to test (must be same feature space as the explainer/model)
+            # row_id = X_test_for_lime.index[0]           # e.g., scaled_X_test_features or X_test_encoded
+            # x_row = X_test_for_lime.loc[row_id]
+
+            # lime_explainer = LimeTabularExplainer(
+            #     training_data=X_train_for_lime.to_numpy(),
+            #     feature_names=X_train_for_lime.columns.tolist(),
+            #     class_names=[str(c) for c in getattr(tuned_model, "classes_", [0, 1])],  # <-- FIXED
+            #     mode="classification",
+            #     discretize_continuous=True,
+            #     sample_around_instance=True,
+            #     random_state=random_state,
+            # )
+
+            # lt = lime_local_deletion_test(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     k_max=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Deletion curve AUC: **{lt['auc']:.4f}** (lower is better). "
+            #     f"Baseline p0={lt['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(lt['flip_k']) if lt['flip_k'] is not None else 'No flip'}."
+            # )
+
+            # corr = lime_local_rank_vs_impact(
+            #     model=tuned_model,
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     num_features=10,
+            #     mask_strategy="mean"
+            # )
+            # val_tab.write(
+            #     f"Spearman ρ (LIME rank vs single-feature impact): **{corr['rho']:.3f}** "
+            #     f"(p={corr['pval']:.3g})."
+            # )
+
+            # Stability
+            # Ensure indices are simple and unique
+            X_test_encoded_copy = X_test_encoded.copy()
+            X_test_encoded_copy.index = pd.RangeIndex(len(X_test_encoded))
+
+            # # 1) Precompute RF attributions once on the FULL test set
+            # A_rf_full = pd.DataFrame(
+            #     A_rf,  # from collect_attributions_for_tests on FULL X_test_encoded
+            #     index=X_test_encoded_copy.index,
+            #     columns=X_test_encoded_copy.columns
+            # )
+
+            # --- 1) Build a hashable fingerprint for LR ---
+            # --- Hashable fingerprint for LR (for cache invalidation) ---
+            # def _rf_model_key(m: RandomForestClassifier) -> str:
+            #     """
+            #     Build a hashable fingerprint for a fitted RF.
+            #     Includes: key hyperparams, n_estimators, feature_importances_,
+            #     oob_score_ (if present). This is sufficient to invalidate cache
+            #     when the trained forest changes.
+            #     """
+            #     parts = []
+            #     # core hyperparams that change the fit
+            #     hp = m.get_params(deep=False)
+            #     key_params = (
+            #         hp.get("n_estimators"), hp.get("criterion"),
+            #         hp.get("max_depth"), hp.get("max_features"),
+            #         hp.get("min_samples_split"), hp.get("min_samples_leaf"),
+            #         hp.get("min_weight_fraction_leaf"), hp.get("max_leaf_nodes"),
+            #         hp.get("bootstrap"), hp.get("class_weight"),
+            #         hp.get("ccp_alpha"), hp.get("random_state")
+            #     )
+            #     parts.append(str(key_params).encode())
+
+            #     # learned quantities
+            #     if hasattr(m, "n_estimators"):
+            #         parts.append(str(m.n_estimators).encode())
+            #     if hasattr(m, "feature_importances_"):
+            #         parts.append(np.asarray(m.feature_importances_, dtype=np.float64).tobytes())
+            #     if hasattr(m, "oob_score_"):
+            #         parts.append(str(m.oob_score_).encode())
+
+            #     return str(abs(hash(b"||".join(parts))))
+
+            # # -------- Cache full-test RF attributions (ignore unhashable model) --------
+            # @st.cache_data(show_spinner=False)
+            # def _rf_full_attr(
+            #     _model: RandomForestClassifier,  # leading underscore => Streamlit won't hash it
+            #     model_key: str,                  # <- hashable fingerprint to invalidate when RF changes
+            #     X_train_enc: pd.DataFrame,       # needed by your collector
+            #     X_val_enc: pd.DataFrame
+            # ) -> pd.DataFrame:
+            #     A = collect_attributions_for_tests(
+            #         lr_model=None,
+            #         X_train_scaled_bg=None, X_val_scaled=None,
+            #         rf_model=_model,
+            #         xgb_clf=None,
+            #         X_train_enc=X_train_enc,
+            #         X_val_enc=X_val_enc,
+            #         xgb_booster=None,
+            #         use_streamlit=False
+            #     )["rf"]  # -> (n_val, n_features)
+            #     return pd.DataFrame(A, index=X_val_enc.index, columns=X_val_enc.columns)
+
+            # # -------- Build cache + getter in your RF branch --------
+            # rf_key = _rf_model_key(tuned_model)
+            # A_rf_full = _rf_full_attr(
+            #     _model=tuned_model,
+            #     model_key=rf_key,
+            #     X_train_enc=X_train_encoded,
+            #     X_val_enc=X_test_encoded,
+            # )
+
+            # def get_attr_rf_cached(X_batch: pd.DataFrame) -> np.ndarray:
+            #     # fast path: reuse precomputed rows
+            #     try:
+            #         return A_rf_full.loc[X_batch.index].to_numpy()
+            #     except KeyError:
+            #         # small-batch recompute for perturbed rows not in the cache
+            #         A_tmp = collect_attributions_for_tests(
+            #             rf_model=tuned_model,
+            #             X_train_enc=X_train_encoded,
+            #             X_val_enc=X_batch,
+            #             use_streamlit=False
+            #         )["rf"]
+            #         return A_tmp
+
+            # # -------- Local stability UI (RF) --------
+            # with val_tab:
+            #     st.markdown("### Local Stability (Random Forest)")
+            #     rf_row_id = st.selectbox("Pick a row (RF):", X_test_encoded.index.tolist(), index=0, key="rf_row_pick")
+            #     n_pert = st.slider("Perturbations", 10, 100, 30, key="rf_npert")
+            #     noise = st.number_input("Numeric noise (σ)", 0.0, 1.0, 0.02, 0.01, key="rf_noise")
+            #     flip = st.number_input("Flip prob (binary/one-hot)", 0.0, 1.0, 0.05, 0.01, key="rf_flip")
+
+            #     # heuristics: treat uint8 one-hots as binary; the rest as numeric
+            #     binary_cols_rf  = [c for c in X_test_encoded.columns
+            #                        if set(pd.unique(X_test_encoded[c])).issubset({0, 1})]
+            #     numeric_cols_rf = [c for c in X_test_encoded.columns if c not in binary_cols_rf]
+
+            #     if st.button("Run local stability (RF)"):
+            #         report = local_stability_report_generic(
+            #             get_attr_for_batch=get_attr_rf_cached,
+            #             X_matrix=X_test_encoded,
+            #             row_id=rf_row_id,
+            #             numeric_cols=numeric_cols_rf,
+            #             binary_cols=binary_cols_rf,
+            #             onehot_groups=onehot_groups,  # your existing dict
+            #             n_perturb=n_pert,
+            #             noise_scale=noise,
+            #             flip_prob=flip,
+            #             k_list=(5, 10)
+            #         )
+            #         st.write(f"Kendall’s τ (mean): **{report['kendall_tau_mean']:.3f}**")
+            #         st.write(f"Spearman ρ (mean): **{report['spearman_rho_mean']:.3f}**")
+            #         st.write(f"Avg std(|attrib|): **{report['mean_attr_std']:.4f}**")
+            #         st.write({f"Top-{k} overlap": f"{report['topk_overlap_mean'][k]:.2f}" for k in (5, 10)})
+            #         st.dataframe(report["attr_std_by_feature"].head(12).to_frame("std").style.format({"std": "{:.4f}"}))
+
+            # Sanity checks (optional but helpful)
+            # assert A_rf_full.shape[0] == len(X_test_encoded_copy), "Mismatch: A_rf_full rows vs X_test_encoded"
+            # assert (A_rf_full.columns == X_test_encoded_copy.columns).all(), "Mismatch: columns differ"
+
+            # Build a position map for robust slicing even if a resample resets index
+            # pos_map = pd.Series(np.arange(len(X_test_encoded_copy)), index=X_test_encoded_copy.index)
+
+            # def get_attr_rf_cached(X_subset: pd.DataFrame):
+            #     # Primary: index-aligned slice (fast path)
+            #     try:
+            #         return A_rf_full.loc[X_subset.index].to_numpy()
+            #     except KeyError:
+            #         # Fallback: map indices to positions (handles reset_index in resample)
+            #         idx = pos_map.reindex(X_subset.index)
+            #         if idx.isna().any():
+            #             # As a last resort, assume positional slice (only works if X_subset
+            #             # is taken by .iloc from the same matrix)
+            #             return A_rf_full.to_numpy()[np.arange(len(X_subset)), :]
+            #         return A_rf_full.to_numpy()[idx.to_numpy().astype(int), :]
+
+            # Now run stability (cheap, no SHAP recompute)
+            # stab = stability_report(get_attr_rf_cached, X_test_encoded_copy, n_boot=20, sample_frac=0.8, seed=42)
+            # val_tab.markdown("### Stability")
+            # val_tab.write(f"Kendall’s τ (mean ± sd): **{stab['kendall_tau_mean']:.3f} ± {stab['kendall_tau_std']:.3f}**")
+
+
+            # # Sanity (label randomization)
+            # def _to_hashable_tuple(idx: pd.Index) -> tuple:
+            #     vals = idx.tolist()
+            #     try:
+            #         tuple(vals)
+            #         return tuple(vals)
+            #     except TypeError:
+            #         return tuple(map(str, vals))
+
+            # @st.cache_data(show_spinner=False)
+            # def _rf_attr_cache(A_rf_array: np.ndarray,
+            #                    index_values: tuple,
+            #                    column_values: tuple) -> tuple[pd.DataFrame, pd.Series]:
+            #     """
+            #     Materialize RF attributions into a DataFrame with original index/columns,
+            #     and build a position map for robust slicing.
+            #     """
+            #     x_index = pd.Index(list(index_values))
+            #     x_columns = pd.Index(list(column_values))
+            #     A_rf_full_df = pd.DataFrame(A_rf_array, index=x_index, columns=x_columns).astype("float64")
+
+            #     # safety checks
+            #     if A_rf_full_df.shape[0] != len(x_index):
+            #         raise ValueError("A_rf_full rows != X_test_encoded rows.")
+            #     if not A_rf_full_df.columns.equals(x_columns):
+            #         raise ValueError("A_rf_full columns differ from X_test_encoded columns.")
+            #     if not x_index.is_unique:
+            #         st.warning("X_test_encoded has non-unique index; positional fallback may be used.")
+
+            #     pos_map = pd.Series(np.arange(len(x_index)), index=x_index)
+            #     return A_rf_full_df, pos_map
+
+            # def make_get_attr_rf_cached(A_rf_full_df: pd.DataFrame, pos_map: pd.Series):
+                # def _getter(X_subset: pd.DataFrame) -> np.ndarray:
+                #     # fast path: identical labels & order
+                #     if len(X_subset.index) and X_subset.index.equals(A_rf_full_df.index):
+                #         return A_rf_full_df.to_numpy()
+
+                #     # align by label (preserves order of X_subset)
+                #     if X_subset.index.isin(A_rf_full_df.index).all():
+                #         return A_rf_full_df.reindex(X_subset.index).to_numpy()
+
+                #     # fallback: position map (handles reset_index/resamples)
+                #     idx = pos_map.reindex(X_subset.index)
+                #     if not idx.isna().any():
+                #         return A_rf_full_df.to_numpy()[idx.to_numpy().astype(int), :]
+
+                #     # last resort: pure positional (warn)
+                #     st.warning("Attribution slice fell back to pure positional matching; verify index handling.", icon="⚠️")
+                #     n = len(X_subset)
+                #     if n > len(A_rf_full_df):
+                #         raise ValueError("Subset longer than reference — cannot slice positionally.")
+                #     return A_rf_full_df.to_numpy()[:n, :]
+                # return _getter
+
+            # ---- RF sanity: build in strict order, keep everything inside the RF branch ----
+            # 1) get per-row attributions (array) once for FULL X_test_encoded
+            # attribs = collect_attributions_for_tests(
+            #     rf_model=tuned_model,
+            #     X_train_enc=X_train_encoded,
+            #     X_val_enc=X_test_encoded,
+            #     lr_model=None, xgb_clf=None, X_train_scaled_bg=None, X_val_scaled=None,
+            #     xgb_booster=None,
+            #     use_streamlit=False
+            # )
+            # A_rf_array = attribs["rf"]  # shape: (n_test, n_features)
+
+            # # 2) cache the DF + position map using hashable surrogates
+            # A_rf_full_df, pos_map = _rf_attr_cache(
+            #     A_rf_array,
+            #     _to_hashable_tuple(X_test_encoded.index),
+            #     _to_hashable_tuple(X_test_encoded.columns),
+            # )
+            
+            # assert A_rf_full_df.shape[0] == len(X_test_encoded_copy), "Mismatch: A_rf_full_df rows vs X_test_encoded"
+            # assert A_rf_full_df.columns.equals(X_test_encoded.columns), "Mismatch: columns differ"
+
+            # 3) getter that reuses the cached matrix
+            # get_attr_rf_cached = make_get_attr_rf_cached(A_rf_full_df, pos_map)
+
+            # 4) run sanity inside the UI tab (no references to A_rf_full outside)
+            # with val_tab:
+            #     n = min(1000, len(X_test_encoded))
+            #     X_val_small = X_test_encoded.sample(n=n, random_state=42)
+            #     y_val_small = y_test.loc[X_val_small.index]
+        
+            #     san = sanity_report(
+            #         model=tuned_model,
+            #         X_val=X_val_small,
+            #         y_val=y_val_small,
+            #         get_attribs_callable=get_attr_rf_cached,  # your cached slice
+            #         randomize="labels",
+            #         seed=42,
+            #     )
+            #     st.write(
+            #         f"Spearman ρ vs original after label randomization: "
+            #         f"**{san['spearman_rho_vs_original']:.3f}**"
+            #     )
+
+            # with val_tab:
+            #     st.markdown("### Sanity (Random Forest)")
+
+            #     # Just pick a row + seed; no button, no feature selector
+            #     rf_row_id = st.selectbox(
+            #         "Pick a row for sanity (RF):",
+            #         X_test_encoded.index.tolist(), index=0, key="rf_row_sanity_pick"
+            #     )
+            #     seed = st.number_input("Seed", 0, 10_000_000, 42, key="rf_sanity_seed")
+            #     rng = np.random.RandomState(seed)
+
+            #     # ---------- (A) Label randomization sanity (local but trainable) ----------
+            #     # use a small stratified batch that *includes* the selected row
+            #     X_s, y_s = make_stratified_batch(
+            #         X_test_encoded, y_test, include_index=rf_row_id, n_per_class=80, seed=seed
+            #     )
+
+            #     y_s_num = _ensure_series(y_s, X_s.index)
+                # if y_s_num.dtype == object:
+                #     y_s_num = y_s_num.map({"Yes": 1, "No": 0}).astype(int)
+                # else:
+                #     y_s_num = y_s_num.astype(int)
+
+                # if y_s_num.nunique() < 2:
+                #     st.warning(
+                #         "Label-randomization skipped: the selected batch has only one class. "
+                #         "Pick a different row or increase n_per_class."
+                #     )
+                # else:
+                #     san = sanity_report(
+                #         model=tuned_model,                     # RF model
+                #         X_val=X_s,
+                #         y_val=y_s_num,
+                #         get_attribs_callable=lambda X_batch: get_attr_rf_cached(X_batch),
+                #         randomize="labels",
+                #         seed=seed
+                #     )
+                #     st.write(
+                #         f"Label randomization — Spearman ρ vs. original (local batch): "
+                #         f"**{san['spearman_rho_vs_original']:.3f}** (→ closer to 0 is better)"
+                #     )
+
+
+
+            # get_rf_explanation(tuned_model, background_data_encoded, X_test_encoded, shap_tab)
+            rf_local_shap_by_truth(tuned_model, X_test_encoded, X_test, y_test, 0.426, shap_tab, background_data_encoded)
+            get_lime_explanations_binary(tuned_model, X_test, X_train_encoded, X_test_encoded, y_test, 0.426, lime_tab, title_prefix="Local LIME – Random Forest")
+
+            rf_for_dice = ThresholdedModel(tuned_model, threshold=0.426)
+
+            continuous_features = [
+                "subscription_age",
+                "bill_avg",
+                "service_failure_count",          
+                "download_avg",
+                "upload_avg",
+                "total_usage",
+                "services_count",
+                "download_over_limit"
+            ]
+
+            features_to_vary = [
+                "is_tv_subscriber", "is_movie_package_subscriber", 
+                "bill_avg",
+                "download_over_limit",
+                "contract_stage_0.5-1y", "contract_stage_1-2y", "contract_stage_>2y", "contract_stage_no_contract"
+            ]
+
+            permitted_range = {"bill_avg": [15, 150]}
+
+            results = get_counterfactual_analysis(
+                y_test=y_test,
+                X_test=X_test_encoded,          
+                X_train=X_train_encoded,
+                y_train=y_train,
+                model=rf_for_dice,              
+                continuous_features=continuous_features,
+                counterfactual_tab=counterfactual_tab,
+                features_to_vary=features_to_vary,
+                permitted_range=permitted_range,       # raw bounds
+                scaler=None,                           
+                numeric_feature_names_in_scaler_order=None,
+                immutable_features=immutable,
+                onehot_groups=onehot_groups
+            )
+
 
         elif selected_prediction_model == "XGBoost":
             # Train
@@ -379,13 +2641,422 @@ if selected_dataset in datasets:
             # print("\n[Stage 2] Best (refined):", best_stage2)
             row, bst, params = retrain_xgb_model(X_train_encoded, y_train, X_test_encoded, y_test,
                                                  0.42, 0.01423, 9, 2.7843, 0.7848, 0.6645, 1.0097, 0.0041)
+
+            # def group_fairness_table(df, group_col, y_true='y_true', y_proba='y_proba', threshold=0.42, reference=None):
+            #     ref = reference or df[group_col].value_counts().idxmax()
+
+            #     def recall_pos(g):
+            #         mask = g[y_true] == 1
+            #         if mask.sum() == 0:
+            #             return np.nan
+            #         y_hat = (g[y_proba] >= threshold).astype(int)
+            #         return recall_score(g.loc[mask, y_true], y_hat[mask])
+
+            #     agg = (
+            #         df.groupby(group_col)
+            #           .apply(lambda g: pd.Series({
+            #               'n': len(g),
+            #               'observed_churn_rate': g[y_true].mean(),
+            #               'mean_pred_proba': g[y_proba].mean(),
+            #               f'prediction_rate@{threshold:.3f}': (g[y_proba] >= threshold).mean(),
+            #               'recall_pos': recall_pos(g),
+            #           }))
+            #           .reset_index()
+            #     )
+            #     ref_mean = agg.loc[agg[group_col] == ref, 'mean_pred_proba'].values[0]
+            #     agg[f'Δ_vs_{ref}'] = (agg['mean_pred_proba'] - ref_mean).abs()
+            #     agg['stat_parity_ok(≤0.05)'] = agg[f'Δ_vs_{ref}'] <= 0.05
+            #     return agg.sort_values('n', ascending=False), ref
+
+            # # --- config / inputs ---
+            # threshold = 0.42
+            # group_cols = ["contract_stage", "bill_bucket", "usage_tier", "fail_count_bucket",]
+
+            # # IMPORTANT: use the RAW test DF for grouping, not the encoded/scaled matrix.
+            # X_test_original_groups = X_test[group_cols].copy()
+
+            # # y_true must be 0/1
+            # if isinstance(y_test, pd.DataFrame) and "Churn" in y_test.columns:
+            #     y_true = y_test["Churn"].map({"No": 0, "Yes": 1}).astype(int)
+            # elif getattr(y_test, "dtype", None) == object:
+            #     y_true = y_test.map({"No": 0, "Yes": 1}).astype(int)
+            # else:
+            #     y_true = y_test.astype(int)
+
+            # # Choose the feature matrix your Booster was trained on (typically encoded, not scaled unless you scaled during training)
+            # X_for_pred = X_test_encoded  # if your Booster was trained on the encoded matrix
+
+            # # --- normalize `tuned_model` to a dict of models ---
+            # models = {}
+            # # You can add more models here later; for now just the Booster:
+            # models["xgb_final"] = bst  # bst returned by retrain_xgb_model(...)
+
+            # def predict_proba_any(model, X):
+            #     # scikit-like estimators
+            #     if hasattr(model, "predict_proba"):
+            #         return model.predict_proba(X)[:, 1]
+            #     # XGBoost Booster
+            #     if isinstance(model, xgb.Booster):
+            #         # Ensure X is numpy/pandas -> DMatrix
+            #         dtest = xgb.DMatrix(X)
+            #         # For binary:logistic this returns probabilities
+            #         return model.predict(dtest)
+            #     # decision_function fallback (e.g., linear SVM)
+            #     if hasattr(model, "decision_function"):
+            #         from scipy.special import expit
+            #         return expit(model.decision_function(X))
+            #     # last resort: predict hard labels (not ideal)
+            #     yhat = model.predict(X)
+            #     return np.asarray(yhat).astype(float)
+
+            # # --- compute results ---
+            # results = {}
+            # for name, model in models.items():
+            #     y_proba = predict_proba_any(model, X_for_pred)
+
+            #     df_eval = X_test_original_groups.copy()
+            #     df_eval["y_true"]  = pd.Series(y_true.values, index=df_eval.index)
+            #     df_eval["y_proba"] = pd.Series(y_proba,       index=df_eval.index)
+
+            #     model_tables = {}
+            #     for gcol in group_cols:
+            #         sub = df_eval[[gcol, "y_true", "y_proba"]].dropna()
+            #         table, ref = group_fairness_table(sub, group_col=gcol, threshold=threshold)
+            #         model_tables[gcol] = (table, ref)
+            #     results[name] = model_tables
+
+            # # --- Streamlit UI ---
+            # st.title("Fairness Evaluation — Group-Based Metrics")
+            # st.write("Global threshold for recall comparisons (equal opportunity): ", threshold)
+            # for model_name, tables in results.items():
+            #     with st.expander(f"Model: {model_name}", expanded=False):
+            #         for gcol, (table, ref) in tables.items():
+            #             st.subheader(f"Group column: {gcol} (ref: {ref})")
+            #             st.dataframe(table, use_container_width=True)
+            #             csv_buf = StringIO()
+            #             table.to_csv(csv_buf, index=False)
+            #             st.download_button(
+            #                 label=f"Download CSV — {model_name} · {gcol}",
+            #                 data=csv_buf.getvalue(),
+            #                 file_name=f"fairness_{model_name}_{gcol}.csv",
+            #                 mime="text/csv"
+            #             )
+            
             st.subheader("XGBoost Performance Analysis")
             metrics_tab, explainability_tab = st.tabs(["Metrics", "Explanation"])
             column2 = display_xgb_metrics(metrics_tab, row)
-            get_internet_metrics_caption(column2)
+            get_internet_xgb_metrics_caption(column2)
+
+            # Explainability models
+            attribs = collect_attributions_for_tests(
+                lr_model=None,
+                X_train_scaled_bg=None,
+                X_val_scaled=None,
+
+                rf_model=None,
+                xgb_clf=None,                           # you have a native Booster in `bst`
+                X_train_enc=X_train_encoded,
+                X_val_enc=X_test_encoded,
+
+                xgb_booster=bst,                        # native Booster path (pred_contribs)
+                use_streamlit=True
+            )
+            A_xgb_booster = attribs["xgb_booster"]
+            
+            val_tab, shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["Validation","SHAP", "LIME", "Counterfactuals"])
+            shap_tab, lime_tab, counterfactual_tab = explainability_tab.tabs(["SHAP", "LIME", "Counterfactuals"])
+
+
+            # Faithfulness
+            
+            # rep = faithfulness_report(
+            #     model=XGBoosterAdapter(bst, objective="binary:logistic"),
+            #     X_val=X_test_encoded,
+            #     y_val=y_test,
+            #     A=A_xgb_booster,
+            #     feature_names=X_test_encoded.columns.tolist(),
+            #     n_steps=10,
+            #     seed=42,
+            #     use_proba=True
+            # )
+            # val_tab.markdown("### Faithfulness")
+            # val_tab.write(f"Spearman ρ (rank vs. single-feature impact): **{rep['rho']:.3f}**")
+            # val_tab.dataframe(rep["curve"])
+
+            # x_row = X_test_encoded.iloc[0]
+            # a_row = pd.Series(A_xgb_booster[0], index=X_test_encoded.columns)
+
+            # rep = local_faithfulness_report(
+            #     model=bst,               # RF / LR / XGB model object
+            #     x_row=x_row,
+            #     a_row=a_row,
+            #     background=background_data_encoded,
+            #     n_draws=64,
+            #     n_steps=10,
+            #     replace_with="mean"              # or "draw"
+            # )
+            # val_tab.markdown("### Local Faithfulness (this customer)")
+            # val_tab.write(f"Spearman ρ (local): **{rep['rho_local']:.3f}**")
+            # val_tab.line_chart(pd.DataFrame({"p(k)": rep["deletion_curve"]["preds"]}, index=rep["deletion_curve"]["k"]))
+            # val_tab.caption(
+            #     f"Deletion curve AUC: {rep['deletion_curve']['auc']:.4f} (lower is better). "
+            #     f"Baseline p0={rep['deletion_curve']['p0']:.3f}. "
+            #     f"{'Flip at k=' + str(rep['flip_k']) if rep['flip_k'] is not None else ''}"
+            # )
+            # val_tab.dataframe(rep["single_feature_impacts"].head(12).to_frame("local_impact"))
+
+            # X_train_for_lime = X_train_encoded  # use X_train_encoded for RF/XGB branches
+            # X_test_for_lime = X_test_encoded
+            # random_state = 42
+            # # choose a row to test (must be same feature space as the explainer/model)
+            # row_id = X_test_for_lime.index[0]           # e.g., scaled_X_test_features or X_test_encoded
+            # x_row = X_test_for_lime.loc[row_id]
+            # tuned_model = bst
+
+            # if hasattr(tuned_model, "predict_proba"):
+            #     # sklearn model (LR, RF, XGBClassifier)
+            #     predict_fn = tuned_model.predict_proba
+            #     class_names = [str(c) for c in getattr(tuned_model, "classes_", [0, 1])]
+            # else:
+            #     # native Booster (bst)
+            #     booster = bst if isinstance(bst, xgb.Booster) else bst.get_booster()
+            #     feat_names = X_train_for_lime.columns.tolist()
+            #     def predict_fn(X_batch: np.ndarray) -> np.ndarray:
+            #         dm = xgb.DMatrix(X_batch, feature_names=feat_names)
+            #         p1 = booster.predict(dm).reshape(-1)
+            #         return np.column_stack([1.0 - p1, p1])
+            #     class_names = ["0", "1"]
+
+            # # ---- Create LIME explainer on TRAIN data (same feature space as model) ----
+            # lime_explainer = LimeTabularExplainer(
+            #     training_data=X_train_for_lime.to_numpy(),
+            #     feature_names=X_train_for_lime.columns.tolist(),
+            #     class_names=class_names,
+            #     mode="classification",
+            #     discretize_continuous=True,
+            #     sample_around_instance=True,
+            #     random_state=42,
+            # )
+
+            # # ---- Run the tests (note: we pass predict_fn, not model) ----
+            # lt = lime_xgb_local_deletion_test(
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     predict_fn=predict_fn,
+            #     num_features=10,
+            #     k_max=10,
+            #     mask_strategy="mean",
+            # )
+            # val_tab.write(
+            #     f"Deletion curve AUC: **{lt['auc']:.4f}** (lower is better). "
+            #     f"Baseline p0={lt['p0']:.3f}. "
+            #     f"{'Flip at k='+str(lt['flip_k']) if lt['flip_k'] is not None else 'No flip'}."
+            # )
+
+            # corr = lime_xgb_local_rank_vs_impact(
+            #     explainer=lime_explainer,
+            #     X_row=x_row,
+            #     X_background=X_train_for_lime,
+            #     predict_fn=predict_fn,
+            #     num_features=10,
+            #     mask_strategy="mean",
+            # )
+            # val_tab.write(
+            #     f"Spearman ρ (LIME rank vs single-feature impact): **{corr['rho']:.3f}** "
+            #     f"(p={corr['pval']:.3g})."
+            # )
+
+            # Stability
+            # booster_for_shap = _patch_base_score_in_modelfile(bst)
+
+            # # # ✅ take the schema the Booster was trained with
+            # FEAT_TRAIN = booster_for_shap.feature_names or X_train_encoded.columns.tolist()
+
+            # # # hard-schema attrib function that also normalizes dash variants
+            # get_attr_xgb = make_get_attribs_xgb_booster_with_schema(booster_for_shap, FEAT_TRAIN)
+
+            # # (optional but recommended) align the test frame before calling stability_report
+            # from src.shap import align_to_training_columns  # use the one in shap.py
+            # X_test_aligned = align_to_training_columns(X_test_encoded.copy(), FEAT_TRAIN)
+
+            # stab = stability_report(get_attr_xgb, X_test_aligned, n_boot=20, sample_frac=0.8, seed=42)
+
+
+            # val_tab.markdown("### Stability")
+            # val_tab.write(f"Kendall’s τ (mean ± sd): **{stab['kendall_tau_mean']:.3f} ± {stab['kendall_tau_std']:.3f}**")
+
+            # def _xgb_model_key(model) -> str:
+            #     """
+            #     Deterministic fingerprint for a trained XGBoost model.
+            #     Works for xgb.Booster and xgb.XGBClassifier.
+            #     """
+            #     # get raw bytes of the trained trees
+            #     if isinstance(model, xgb.Booster):
+            #         raw = model.save_raw()              # bytearray
+            #         raw_b = bytes(raw)                  # -> bytes
+            #         base = raw_b
+            #         extra = b""
+            #     elif hasattr(model, "get_booster"):     # XGBClassifier
+            #         booster = model.get_booster()
+            #         raw = booster.save_raw()            # bytearray
+            #         raw_b = bytes(raw)
+            #         base = raw_b
+            #         # include key hyperparams to be extra-safe
+            #         hp_names = ["n_estimators", "max_depth", "learning_rate", "subsample",
+            #                     "colsample_bytree", "colsample_bylevel", "colsample_bynode",
+            #                     "reg_lambda", "reg_alpha", "gamma", "min_child_weight", "random_state"]
+            #         hp_vals = tuple(getattr(model, n, None) for n in hp_names)
+            #         extra = repr(hp_vals).encode()
+            #     else:
+            #         # fallback
+            #         return hashlib.sha1(repr(model).encode()).hexdigest()
+
+            #     # stable digest string (streamlit-friendly)
+            #     return hashlib.sha1(base + extra).hexdigest()
+
+            # # 2) Cache full-test contribs (pred_contribs). Ignore unhashable model via leading underscore.
+            # @st.cache_data(show_spinner=False)
+            # def _xgb_full_attr(
+            #     _model,                 # not hashed by Streamlit
+            #     model_key: str,         # hashable fingerprint to invalidate cache when the model changes
+            #     feature_names: tuple,   # tuple(X_test_encoded.columns)
+            #     X_val_index: tuple,     # tuple(X_test_encoded.index)
+            #     X_val_values: np.ndarray
+            # ) -> pd.DataFrame:
+            #     # get Booster
+            #     if isinstance(_model, xgb.Booster):
+            #         booster = _model
+            #     elif hasattr(_model, "get_booster"):
+            #         check_is_fitted(_model)
+            #         booster = _model.get_booster()
+            #     else:
+            #         raise TypeError("Unsupported XGBoost model type for _xgb_full_attr")
+
+            #     feats = list(feature_names)
+            #     dm = xgb.DMatrix(X_val_values, feature_names=feats)
+            #     contribs = booster.predict(dm, pred_contribs=True)   # (n, p+1) last col = bias
+            #     A = contribs[:, :-1]                                 # drop bias to align with features
+            #     return pd.DataFrame(A, index=list(X_val_index), columns=feats)
+
+            # # 3) Pick which model to use for explanations
+            # try:
+            #     xgb_used = bst_patched   # if you patched base_score earlier
+            # except NameError:
+            #     xgb_used = bst           # Booster returned by retrain_xgb_model(...)
+
+            # # Build cache
+            # xgb_key = _xgb_model_key(xgb_used)
+            # A_xgb_full = _xgb_full_attr(
+            #     _model=xgb_used,
+            #     model_key=xgb_key,
+            #     feature_names=tuple(X_test_encoded.columns.tolist()),
+            #     X_val_index=tuple(X_test_encoded.index.tolist()),
+            #     X_val_values=X_test_encoded.to_numpy(),
+            # )
+
+            # # Getter: reuse cache for existing rows; recompute contribs only for perturbed rows
+            # def get_attr_xgb_cached(X_batch: pd.DataFrame) -> np.ndarray:
+            #     try:
+            #         return A_xgb_full.loc[X_batch.index].to_numpy()
+            #     except KeyError:
+            #         feats = X_batch.columns.tolist()
+            #         booster = xgb_used if isinstance(xgb_used, xgb.Booster) else xgb_used.get_booster()
+            #         dm = xgb.DMatrix(X_batch[feats].to_numpy(), feature_names=feats)
+            #         contribs = booster.predict(dm, pred_contribs=True)
+            #         return contribs[:, :-1]
+
+            # 4) Local stability UI
+            # with val_tab:
+            #     st.markdown("### Local Stability (XGBoost)")
+            #     xgb_row_id = st.selectbox("Pick a row (XGB):", X_test_encoded.index.tolist(), index=0, key="xgb_row_pick")
+            #     n_pert = st.slider("Perturbations", 10, 100, 30, key="xgb_npert")
+            #     noise = st.number_input("Numeric noise (σ)", 0.0, 1.0, 0.02, 0.01, key="xgb_noise")
+            #     flip  = st.number_input("Flip prob (binary/one-hot)", 0.0, 1.0, 0.05, 0.01, key="xgb_flip")
+
+            #     # One-hots are strictly {0,1}; the rest numeric
+            #     binary_cols_xgb  = [c for c in X_test_encoded.columns
+            #                         if set(pd.unique(X_test_encoded[c])).issubset({0, 1})]
+            #     numeric_cols_xgb = [c for c in X_test_encoded.columns if c not in binary_cols_xgb]
+
+            #     if st.button("Run local stability (XGB)"):
+            #         report = local_stability_report_generic(
+            #             get_attr_for_batch=get_attr_xgb_cached,
+            #             X_matrix=X_test_encoded,
+            #             row_id=xgb_row_id,
+            #             numeric_cols=numeric_cols_xgb,
+            #             binary_cols=binary_cols_xgb,
+            #             onehot_groups=onehot_groups,   # your existing dict
+            #             n_perturb=n_pert,
+            #             noise_scale=noise,
+            #             flip_prob=flip,
+            #             k_list=(5, 10)
+            #         )
+            #         st.write(f"Kendall’s τ (mean): **{report['kendall_tau_mean']:.3f}**")
+            #         st.write(f"Spearman ρ (mean): **{report['spearman_rho_mean']:.3f}**")
+            #         st.write(f"Avg std(|attrib|): **{report['mean_attr_std']:.4f}**")
+            #         st.write({f"Top-{k} overlap": f"{report['topk_overlap_mean'][k]:.2f}" for k in (5, 10)})
+            #         st.dataframe(report["attr_std_by_feature"].head(12).to_frame("std").style.format({"std": "{:.4f}"}))
+
+            # Sanity (label randomization)
+            # san = sanity_report(
+            #     model=bst,
+            #     X_val=X_test_encoded,
+            #     y_val=y_test,
+            #     get_attribs_callable=get_attr_xgb,
+            #     randomize="labels",
+            #     seed=42
+            # )
+            # val_tab.markdown("### Sanity")
+            # val_tab.write(f"Spearman ρ vs original after label randomization: **{san['spearman_rho_vs_original']:.3f}** "
+            #               "(should drop toward 0 if explanations depend on learned signal)")
 
 
 
+            # get_xgb_explanation(bst, background_data_encoded, X_test_encoded, shap_tab)
+            xgb_local_shap_by_truth(bst, X_test_encoded, X_test, y_test, 0.42, shap_tab, background_data_encoded)
+            get_lime_explanations_binary(bst, X_test, X_train_encoded, X_test_encoded, y_test, 0.42, lime_tab, title_prefix="Local LIME – XGBoost")
+
+            adapted = XGBoosterAdapter(bst, objective="binary:logistic")
+            xgb_for_dice = ThresholdedModel(adapted, threshold=0.42)
+
+            continuous_features = [
+                "subscription_age",
+                "bill_avg",
+                "service_failure_count",          
+                "download_avg",
+                "upload_avg",
+                "total_usage",
+                "services_count",
+                "download_over_limit"
+            ]
+
+            features_to_vary = [
+                "is_tv_subscriber", "is_movie_package_subscriber", 
+                "bill_avg",
+                "download_over_limit",
+                "contract_stage_0.5-1y", "contract_stage_1-2y", "contract_stage_>2y", "contract_stage_no_contract"
+            ]
+
+            permitted_range = {"bill_avg": [15, 150]}
+
+            results = get_counterfactual_analysis(
+                y_test=y_test,
+                X_test=X_test_encoded,          
+                X_train=X_train_encoded,
+                y_train=y_train,
+                model=xgb_for_dice,              
+                continuous_features=continuous_features,
+                counterfactual_tab=counterfactual_tab,
+                features_to_vary=features_to_vary,
+                permitted_range=permitted_range,       # raw bounds
+                scaler=None,                           
+                numeric_feature_names_in_scaler_order=None,
+                immutable_features=immutable,
+                onehot_groups=onehot_groups
+            )
+
+            print(X_train_encoded.info())
 
 
 # ######################## Modeling ####################################################################
@@ -709,4 +3380,5 @@ if selected_dataset in datasets:
 #         '(early lifecycle), not on a 1-year contract, has internet service (vs. “no internet”), pays by electronic ' \
 #         'check, and no TechSupport/OnlineSecurity.\nRisk reducers: not using fiber-optic internet (largest negative)'
 #         ' and StreamingMovies (small negative).')
+
 

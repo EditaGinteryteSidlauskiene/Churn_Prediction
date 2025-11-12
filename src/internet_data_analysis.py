@@ -121,9 +121,9 @@ def engineer_internet_features(dataset):
     ).astype(str)
 
     # --- 1) Define bill buckets ---
-    # Example boundaries: adjust as needed for your dataset’s scale
+    
     data_copy["bill_bucket"] = pd.cut(
-        data_copy["bill_avg"],   # or "TotalCharges", depending on your metric
+        data_copy["bill_avg"],   
         bins=[0, 20, 50, 80, 120, 200, np.inf],
         labels=["<20", "20–50", "50–80", "80–120", "120–200", ">200"],
         right=False

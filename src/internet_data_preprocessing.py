@@ -52,4 +52,5 @@ def get_scaled_internet_features(train_data, test_data):
     test_features_scaled = test_data.copy()
     test_features_scaled[test_continuous_cols] = test_scaled_continuous
 
-    return train_features_scaled, test_features_scaled
+    return scaler, train_features_scaled, test_features_scaled, list(train_continuous_cols)
+

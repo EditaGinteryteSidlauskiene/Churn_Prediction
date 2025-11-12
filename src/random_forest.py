@@ -283,7 +283,7 @@ def display_rf_metrics(metrics_tab, metrics):
 
     return column2
 
-def get_telco_metrics_caption(column2):
+def get_telco_rf_metrics_caption(column2):
 
     column2.caption(body="<br><br>The tuned Random Forest delivers a strong operating balance. On " \
     "the test set it produced 831 true negatives, 204 false positives, 98 false negatives, and 276 " \
@@ -294,7 +294,7 @@ def get_telco_metrics_caption(column2):
     " precision–recall trade-off at this operating point. The model’s ROC-AUC 0.85 shows good separability " \
     "independent of threshold, supporting its reliability for ranking customers by churn risk.", unsafe_allow_html=True)
 
-def get_internet_metrics_caption(column2):
+def get_internet_rf_metrics_caption(column2):
     column2.caption(body="<br><br>After tuning, the Random Forest achieves strong, well-balanced performance on the test set. " \
     "Overall accuracy is 0.909 and balanced accuracy is 0.907, indicating comparable performance on both classes (little " \
     "bias toward the majority class). The model attains precision = 0.912 and recall = 0.926, meaning over 92% of actual " \

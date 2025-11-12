@@ -304,7 +304,7 @@ def display_lr_metrics(metrics_tab, metrics):
 
     return column2
 
-def get_telco_metrics_caption(column2):
+def get_telco_lr_metrics_caption(column2):
     column2.caption(body="<br><br>The logistic regression model demonstrates solid discriminatory " \
         "power (ROC-AUC = 0.84) and a balanced operating point chosen for F1. On the test set " \
         "it produced 838 true negatives, 197 false positives, 126 false negatives, and 248 true " \
@@ -318,7 +318,7 @@ def get_telco_metrics_caption(column2):
         "false positives but miss more churners.", unsafe_allow_html=True)
     
 
-def get_internet_metrics_caption(column2):
+def get_internet_lr_metrics_caption(column2):
     column2.caption(body="After hyperparameter tuning, the Logistic Regression model (C = 0.01, class_weight = " \
     "'balanced', threshold = 0.408) achieved strong and well-balanced performance on the test set. The model " \
     "reached an accuracy of 0.865 and a balanced accuracy of 0.860, indicating that it performs consistently across " \

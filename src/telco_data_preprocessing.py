@@ -96,10 +96,10 @@ def get_scaled_telco_features(train_data, test_data):
     train_features_scaled = train_data.copy()
     train_features_scaled[train_continuous_cols] = train_scaled_continuous
 
-    test_features_scaled = test_data.copy()
+    test_features_scaled = test_data.copy() 
     test_features_scaled[test_continuous_cols] = test_scaled_continuous
 
-    return train_features_scaled, test_features_scaled
+    return scaler, train_features_scaled, test_features_scaled, list(train_continuous_cols)
 
 def split_telco_data(dataset):
     # Split the data

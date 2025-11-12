@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 from sklearn.metrics import confusion_matrix
+from src.threshold_model import ThresholdedModel
 
 def render_confusion_matrix(y_true, y_proba, threshold, labels=(0, 1), title="Confusion Matrix",
                             title_size=8, tick_size=7, cell_text_size=6):
@@ -34,3 +35,6 @@ def render_confusion_matrix(y_true, y_proba, threshold, labels=(0, 1), title="Co
     # Also show the raw table (optional)
     df_cm = pd.DataFrame(cm, index=["True 0", "True 1"], columns=["Pred 0", "Pred 1"])
     return fig
+
+def wrap_for_threshold(model, threshold: float):
+    return ThresholdedModel(model, threshold)

@@ -551,7 +551,7 @@ def display_xgb_metrics(metrics_tab, metrics):
 
     return column2
 
-def get_telco_metrics_caption(column2):
+def get_telco_xgb_metrics_caption(column2):
 
     column2.caption(body="<br><br>The tuned XGBoost model shows balanced performance at the " \
     "chosen operating threshold. On the test set it produced 814 true negatives, 221 false " \
@@ -563,7 +563,7 @@ def get_telco_metrics_caption(column2):
     "good ranking ability independent of threshold, indicating that XGBoost separates churners from non-" \
     "churners reasonably well, though not as strongly as the Random Forest in your results.", unsafe_allow_html=True)
 
-def get_internet_metrics_caption(column2):
+def get_internet_xgb_metrics_caption(column2):
 
     column2.caption(body="<br><br>After tuning, XGBoost reaches accuracy = 0.913 and balanced accuracy = 0.911, showing similar sensitivity to both classes (little " \
     "bias toward the majority class). The model achieves precision = 0.920 and recall = 0.924, so about 92% of actual" \
