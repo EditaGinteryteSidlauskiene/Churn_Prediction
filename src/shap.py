@@ -51,24 +51,46 @@ def plot_precomputed_shap(
     shap_tab,
     run_id: str = "latest",
     top_n: int = 15,
-    X_for_color: pd.DataFrame | None = None,   # <- pass your scaled features here
+    X_for_color: pd.DataFrame | None = None,  # pass scaled_X_test_features here
 ):
-    # load precomputed SHAP arrays
-    from src.helpers_shap import load_shap
+
+    # 1) Load cached SHAP arrays + metadata
     shap_vals, base_vals, cols, idx = load_shap(dataset, model, run_id)
 
-        # --- Tidy long format for Plotly ---
-    feat_df = pd.DataFrame(shap_vals, cols, idx)
+    # 2) DataFrames for SHAP and (optional) feature values
+    shap_df = pd.DataFrame(shap_vals, columns=cols, index=idx)
 
+    if X_for_color is not None:
+        # Align rows/cols strictly to avoid mismatches
+        feat_df = X_for_color.reindex(index=shap_df.index, columns=shap_df.columns)
+    else:
+        feat_df = None
+
+    # 3) Keep top_n features by mean |SHAP|
+    top_feats = (
+        shap_df.abs().mean(axis=0)
+        .sort_values(ascending=False)
+        .head(top_n)
+        .index
+    )
+    shap_top = shap_df[top_feats]
+
+    # 4) Long/tidy format (and join feature values for color)
     long = (
-        shap_df.stack().rename("shap")
-        .to_frame()
-        .join(feat_df.stack().rename("value"))
+        shap_top.stack().rename("shap").to_frame()
         .reset_index()
         .rename(columns={"level_0": "row", "level_1": "feature"})
     )
 
-    # --- rank features by mean(|SHAP|) ---
+    if feat_df is not None:
+        vlong = (
+            feat_df[top_feats].stack().rename("value").to_frame()
+            .reset_index()
+            .rename(columns={"level_0": "row", "level_1": "feature"})
+        )
+        long = long.merge(vlong, on=["row", "feature"], how="left")
+
+    # 5) Order features by mean |SHAP|
     feat_order = (
         long.groupby("feature")["shap"]
             .apply(lambda s: s.abs().mean())
@@ -76,96 +98,37 @@ def plot_precomputed_shap(
             .index.tolist()
     )
 
-    # --- 1) Beeswarm-like strip (direction + value color) ---
-    # Right = raises churn prob; Left = lowers churn prob
-    fig_beeswarm = px.strip(
-        long, x="shap", y="feature", color="value",
-        orientation="h",
-        hover_data={"row": True, "value": ":.3f", "shap": ":.4f"},
-        title="Global Feature Impact on Churn"
-    )
+    # 6) Beeswarm (color by feature value if available)
+    if "value" in long.columns:
+        fig_beeswarm = px.strip(
+            long, x="shap", y="feature", color="value",
+            orientation="h",
+            hover_data={"row": True, "value": ":.3f", "shap": ":.4f"},
+            title=f"{dataset} · {model} — Global Feature Impact on Churn (precomputed)",
+        )
+        fig_beeswarm.update_layout(coloraxis_showscale=False)
+        # If your features are 0..1 scaled and you want same range:
+        # fig_beeswarm.update_layout(coloraxis=dict(cmin=0, cmax=1))
+    else:
+        fig_beeswarm = px.strip(
+            long, x="shap", y="feature",
+            orientation="h",
+            hover_data={"row": True, "shap": ":.4f"},
+            title=f"{dataset} · {model} — Global Feature Impact on Churn (precomputed)",
+        )
+
     fig_beeswarm.update_layout(yaxis=dict(categoryorder="array", categoryarray=feat_order))
     fig_beeswarm.update_traces(jitter=0.35, marker={"opacity": 0.55, "size": 4})
     fig_beeswarm.update_layout(
-        yaxis_title="Feature", 
+        yaxis_title="Feature",
         xaxis_title="Impact on churn probability",
-        coloraxis_showscale=False
-        )
-    fig_beeswarm.update_layout(coloraxis=dict(cmin=0, cmax=1))
+    )
 
     with shap_tab:
-        st.markdown(
-                "### Global Explanation"
-            )
-        column1, column2 = st.columns([2, 1])
-        column1.plotly_chart(fig_beeswarm)
+        st.markdown("### Global Explanation")
+        c1, c2 = st.columns([2, 1])
+        c1.plotly_chart(fig_beeswarm, use_container_width=True)
 
-    #     # make DataFrame
-    # shap_df = pd.DataFrame(values, columns=cols, index=idx)
-
-    # # optional color matrix (must align on rows & columns)
-    # if X_for_color is not None:
-    #     # align strictly to avoid mismatches
-    #     Xc = X_for_color.reindex(index=shap_df.index, columns=shap_df.columns)
-    # else:
-    #     Xc = None
-
-    # # pick top features by mean |SHAP|
-    # top_feats = (
-    #     np.abs(shap_df).mean(axis=0)
-    #     .sort_values(ascending=False)
-    #     .head(top_n)
-    #     .index
-    # )
-
-    # # long/tidy with optional 'value' column for color
-    # long = shap_df[top_feats].stack().rename("shap").to_frame().reset_index()
-    # long = long.rename(columns={"level_0": "row", "level_1": "feature"})
-
-    # if Xc is not None:
-    #     vlong = (
-    #         Xc[top_feats].stack().rename("value").to_frame().reset_index()
-    #         .rename(columns={"level_0": "row", "level_1": "feature"})
-    #     )
-    #     long = long.merge(vlong, on=["row", "feature"], how="left")
-
-    # # y-order by mean |SHAP|
-    # order = (
-    #     long.groupby("feature")["shap"]
-    #         .apply(lambda s: s.abs().mean())
-    #         .sort_values()
-    #         .index
-    # )
-
-    # # figure (match get_lr_explanation)
-    # if Xc is not None:
-    #     fig = px.strip(
-    #         long, x="shap", y="feature", color="value",
-    #         orientation="h",
-    #         hover_data={"row": True, "value": ":.3f", "shap": ":.4f"},
-    #         title=f"{dataset} · {model} — Global Feature Impact on Churn (precomputed)"
-    #     )
-    #     fig.update_layout(coloraxis_showscale=False)
-    #     # if your features are 0..1 scaled and you want identical color range:
-    #     # fig.update_layout(coloraxis=dict(cmin=0, cmax=1))
-    # else:
-    #     # fallback without color
-    #     fig = px.strip(
-    #         long, x="shap", y="feature",
-    #         orientation="h",
-    #         hover_data={"row": True, "shap": ":.4f"},
-    #         title=f"{dataset} · {model} — Global Feature Impact on Churn (precomputed)"
-    #     )
-
-    # fig.update_layout(yaxis=dict(categoryorder="array", categoryarray=order))
-    # fig.update_traces(jitter=0.35, marker={"opacity": 0.55, "size": 4})
-    # fig.update_layout(
-    #     yaxis_title="Feature",
-    #     xaxis_title="Impact on churn probability",
-    # )
-
-    # with shap_tab:
-    #     st.plotly_chart(fig, use_container_width=True)
 
 
 # def get_lr_explanation(lr_model, background_data, X_test_scaled, shap_tab, top_n=15):
