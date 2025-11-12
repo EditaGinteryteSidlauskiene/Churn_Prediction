@@ -43,7 +43,7 @@ from scipy.stats import kendalltau, spearmanr
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.utils.validation import check_is_fitted
 import hashlib
-from helpers_shap import save_shap
+from src.helpers_shap import save_shap
 
 def _spearman_abs(a: np.ndarray, b: np.ndarray) -> float:
     """Spearman ρ between |a| and |b| (robust to sign)."""
